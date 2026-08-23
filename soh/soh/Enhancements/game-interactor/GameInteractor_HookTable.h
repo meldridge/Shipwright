@@ -53,6 +53,10 @@ DEFINE_HOOK(OnPlayerShieldControl, (float* sp50, float* sp54));
 DEFINE_HOOK(OnPlayDestroy, ());
 DEFINE_HOOK(OnPlayDrawBegin, ());
 DEFINE_HOOK(OnPlayDrawEnd, ());
+// Fired from the graphics callback, where the last completed frame's depth
+// buffer can be sampled. Runs before the first OTRGetPixelDepth of the frame,
+// so listeners share that single readback rather than forcing another.
+DEFINE_HOOK(OnGraphCallback, ());
 DEFINE_HOOK(OnVanillaBehavior, (GIVanillaBehavior flag, bool* result, va_list originalArgs));
 DEFINE_HOOK(OnSaveFile, (int32_t fileNum, int32_t sectionID));
 DEFINE_HOOK(OnLoadFile, (int32_t fileNum));

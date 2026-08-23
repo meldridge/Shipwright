@@ -7,6 +7,7 @@
 #include "soh/OTRGlobals.h"
 #include "soh/ResourceManagerHelpers.h"
 #include "soh/Enhancements/savestate_serialize.h"
+#include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
 
 typedef enum {
     /* 0 */ LENS_FLARE_CIRCLE0,
@@ -240,6 +241,9 @@ void Environment_GraphCallback(GraphicsContext* gfxCtx, void* param) {
 
     OTRGetPixelDepthPrepare(D_8015FD7E, D_8015FD80);
     Lights_GlowCheckPrepare(play);
+    // Must stay ahead of the first read below: that one flushes every queued
+    // coordinate at once, so listeners here get their samples for free.
+    GameInteractor_ExecuteOnGraphCallback();
 
     D_8011FB44 = Environment_GetPixelDepth(D_8015FD7E, D_8015FD80);
     Lights_GlowCheck(play);

@@ -55,6 +55,7 @@ void GameInteractor_ExecuteOnDungeonKeyUsedHooks(uint16_t mapIndex);
 void GameInteractor_ExecuteOnPlayDestroy();
 void GameInteractor_ExecuteOnPlayDrawBegin();
 void GameInteractor_ExecuteOnPlayDrawEnd();
+void GameInteractor_ExecuteOnGraphCallback();
 bool GameInteractor_Should(GIVanillaBehavior flag, uint32_t result, ...);
 
 // MARK: -  Save Files
