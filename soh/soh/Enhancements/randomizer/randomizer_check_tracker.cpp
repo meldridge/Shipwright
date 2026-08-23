@@ -619,7 +619,10 @@ static constexpr int kSeenMaxProbeCoordinates = 48;
 static constexpr float kSeenMinScreenRadius = 3.0f;
 
 // Bounding radii, used both to spread the probes over the model and to size the
-// depth slab. Generous is safe: a probe that misses reads background and fails.
+// depth slab. NOTE: this is proximity, not attribution - a wider radius admits
+// more unrelated geometry, and background close behind a thin model falls inside
+// the slab. Being replaced by renderer-assisted sampling of the actual drawn
+// triangles; until then these values bound a known-approximate test.
 static constexpr float kSeenRadiusChestLarge = 30.0f;
 static constexpr float kSeenRadiusChestSmall = 15.0f;
 static constexpr float kSeenRadiusItem = 12.0f;
@@ -665,8 +668,12 @@ static bool seenProbesInFlightValid = false;
 // Diagnostics, surfaced in the tracker's settings window.
 static int seenProbeCoordinatesLastFrame = 0;
 static int seenProbeCandidatesLastFrame = 0;
-static int seenProbeDeferredLastFrame = 0;
+static int seenProbeDeferredLastFrame = 0; // eligible, but no budget left this frame
+static int seenProbeRejectedLastFrame = 0; // eligible, but would not project usefully
 static int seenProbeMatchesLastFrame = 0;
+// Fairness is keyed by check, not by position: the eligible list is rebuilt from
+// the actor lists every frame and its order is not stable.
+static RandomizerCheck seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
 
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
@@ -768,10 +775,9 @@ static bool SeenPointOnScreen(const SeenProbePoint& point) {
 }
 
 // Spreads probes over a candidate's projected disc and sizes the depth slab to
-// its bounding radius. The centre sample plus four at 60% of the radius keeps
-// them inside the silhouette of anything roughly convex; a probe that lands off
-// the model reads background depth and fails the slab, so an over-large radius
-// costs sensitivity rather than correctness.
+// its bounding radius. A sample landing off the model does not reliably fail:
+// anything within an actor-sized depth interval passes, including a near
+// occluder or background just behind the model. Interim approximation only.
 static bool SeenBuildProbes(const Vec3f& centre, float radius, SeenProbeRecord& record) {
     SeenProbePoint origin;
     if (!SeenProjectPoint(centre, origin) || !SeenPointOnScreen(origin)) {
@@ -935,16 +941,27 @@ void CheckTrackerSeenItemsFrame() {
     // later entries starving behind whatever the actor lists happen to yield
     // first. A deferred candidate is simply not sampled this frame, which the
     // evaluation pass treats as a non-match and therefore breaks its run.
-    static size_t scheduleCursor = 0;
     const size_t candidateCount = eligible.size();
     if (candidateCount == 0) {
-        scheduleCursor = 0;
+        seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
+        seenProbeCandidatesLastFrame = 0;
+        seenProbeDeferredLastFrame = 0;
+        seenProbeRejectedLastFrame = 0;
         return;
     }
-    scheduleCursor %= candidateCount;
+    // Resume after whichever check led last frame, if it is still eligible.
+    size_t startAt = 0;
+    for (size_t i = 0; i < candidateCount; i++) {
+        if (eligibleChecks[i] == seenProbeScheduleAfter) {
+            startAt = (i + 1) % candidateCount;
+            break;
+        }
+    }
     int coordinateBudget = kSeenMaxProbeCoordinates;
+    int rejected = 0;
+    int deferred = 0;
     size_t examined = 0;
-    size_t cursor = scheduleCursor;
+    size_t cursor = startAt;
     while (examined < candidateCount && coordinateBudget >= kSeenProbeMatchesRequired) {
         Actor* actor = eligible[cursor];
         RandomizerCheck rc = eligibleChecks[cursor];
@@ -967,18 +984,20 @@ void CheckTrackerSeenItemsFrame() {
         float radius = SeenCandidateRadius(actor, isChest);
         centre.y += radius; // models sit on their origin, so aim at the middle
         if (!SeenBuildProbes(centre, radius, record)) {
+            rejected++; // off screen, too small, or unprojectable
             continue;
         }
         if (record.pointCount > coordinateBudget) {
-            continue; // no room this frame; the round-robin will come back to it
+            deferred++; // no room this frame; the round-robin will come back to it
+            continue;
         }
         coordinateBudget -= record.pointCount;
         seenProbesPending.push_back(record);
     }
     seenProbeCandidatesLastFrame = static_cast<int>(candidateCount);
-    seenProbeDeferredLastFrame = static_cast<int>(candidateCount - seenProbesPending.size());
-    // Advance so a different candidate leads next frame.
-    scheduleCursor = (scheduleCursor + 1) % candidateCount;
+    seenProbeRejectedLastFrame = rejected;
+    seenProbeDeferredLastFrame = deferred;
+    seenProbeScheduleAfter = eligibleChecks[startAt];
 }
 
 // Runs from the graphics callback, where the depth buffer holds the frame built
@@ -1017,9 +1036,9 @@ void CheckTrackerDepthProbeFrame() {
             int matches = 0;
             for (int i = 0; i < record.pointCount; i++) {
                 int32_t sampled = OTRGetPixelDepth(record.points[i].x, record.points[i].y) * 4 >> 3;
-                // Nearer than the slab is an occluder; further means the probe
-                // missed the model and saw past it. Only the candidate's own
-                // surface lands inside.
+                // Passes when some depth-writing surface lies within an
+                // actor-sized interval of the candidate's centre. That is not
+                // proof the candidate wrote it - see the note on the radii.
                 if (std::abs(sampled - record.points[i].expectedZ) <= record.slabHalfWidth) {
                     matches++;
                 }
@@ -1536,6 +1555,17 @@ void Teardown() {
     seenItemFrames.clear();
     seenProbesPending.clear();
     seenProbesInFlight.clear();
+    seenProbesPendingValid = false;
+    seenProbesInFlightValid = false;
+    seenProbesPendingFrame = 0;
+    seenProbesInFlightFrame = 0;
+    seenProbesLastEvaluated = UINT32_MAX;
+    seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
+    seenProbeCoordinatesLastFrame = 0;
+    seenProbeCandidatesLastFrame = 0;
+    seenProbeDeferredLastFrame = 0;
+    seenProbeRejectedLastFrame = 0;
+    seenProbeMatchesLastFrame = 0;
 
     lastLocationChecked = RC_UNKNOWN_CHECK;
 }
