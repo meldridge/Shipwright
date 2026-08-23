@@ -141,6 +141,13 @@ void Messagebox_ShowErrorBox(char* title, char* body);
 extern "C" {
 #endif
 uint64_t GetUnixTimestamp();
+// Declared for C above; C++ callers need them too.
+#ifdef __cplusplus
+void OTRGetPixelDepthPrepare(float x, float y);
+uint16_t OTRGetPixelDepth(float x, float y);
+float OTRGetDimensionFromLeftEdge(float v);
+float OTRGetDimensionFromRightEdge(float v);
+#endif
 #ifdef __cplusplus
 };
 #endif
