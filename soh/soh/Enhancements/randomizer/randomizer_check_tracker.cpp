@@ -604,7 +604,7 @@ void CheckTrackerHintRevealed(RandomizerHint hintKey) {
 // real frustum, close enough to read, and unoccluded from the camera.
 
 // Seen-detection tuning, shared by the world-item and chest paths.
-static constexpr float kSeenMaxDepth = 1200.0f; // max view depth to count
+static constexpr float kSeenMaxDepth = 1000.0f; // max depth along the camera axis
 static constexpr int kSeenFramesRequired = 8;   // consecutive frames looked at
 // Occlusion-ray targets — these correct for actor height, not eagerness.
 static constexpr float kSeenItemRayYOffset = 15.0f;  // above a grounded item
