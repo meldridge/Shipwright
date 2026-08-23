@@ -657,6 +657,16 @@ static std::vector<SeenProbeRecord> seenProbesInFlight;
 static uint32_t seenProbesInFlightFrame = 0;
 static uint32_t seenProbesPendingFrame = 0;
 static uint32_t seenProbesLastEvaluated = UINT32_MAX;
+// Every gameplay frame produces a batch, empty ones included: an empty batch is
+// what makes "consecutive" mean consecutive, since it resets every counter.
+static bool seenProbesPendingValid = false;
+static bool seenProbesInFlightValid = false;
+
+// Diagnostics, surfaced in the tracker's settings window.
+static int seenProbeCoordinatesLastFrame = 0;
+static int seenProbeCandidatesLastFrame = 0;
+static int seenProbeDeferredLastFrame = 0;
+static int seenProbeMatchesLastFrame = 0;
 
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
@@ -858,10 +868,14 @@ void CheckTrackerSeenItemsFrame() {
     if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO) {
         return;
     }
+    // This frame's batch exists from here on, even if nothing qualifies for it.
+    seenProbesPending.clear();
+    seenProbesPendingFrame = gPlayState->gameplayFrames;
+    seenProbesPendingValid = true;
     // Nothing is redrawn behind the pause menu, so the depth buffer still holds
-    // whatever was on screen before it opened.
+    // whatever was on screen before it opened. Leaving the batch empty ends any
+    // run of consecutive frames rather than freezing it.
     if (gPlayState->pauseCtx.state != 0) {
-        seenProbesPending.clear();
         return;
     }
     // Don't let a glimpse in one scene carry over into the next.
@@ -869,20 +883,21 @@ void CheckTrackerSeenItemsFrame() {
     if (gPlayState->sceneNum != lastSceneNum) {
         lastSceneNum = gPlayState->sceneNum;
         seenItemFrames.clear();
-        seenProbesPending.clear();
         seenProbesInFlight.clear();
+        seenProbesInFlightValid = false;
     }
     // Read the CVar, not the `mystery` display cache: that one is only refreshed
     // while the tracker window is drawing, so a closed tracker leaves it false.
     const bool mysteryShuffle = CVarGetInteger(CVAR_RANDOMIZER_ENHANCEMENT("MysteriousShuffle"), 0);
-    seenProbesPending.clear();
-    seenProbesPendingFrame = gPlayState->gameplayFrames;
-    int coordinateBudget = kSeenMaxProbeCoordinates;
-    for (int i = 0; i < ACTORCAT_MAX && coordinateBudget >= kSeenProbesPerCandidate; i++) {
-        for (Actor* actor = gPlayState->actorCtx.actorLists[i].head;
-             actor != nullptr && coordinateBudget >= kSeenProbesPerCandidate; actor = actor->next) {
+    // Gather every eligible candidate first; the budget is applied afterwards so
+    // that actor-list order can't let the same few checks monopolise it.
+    std::vector<Actor*> eligible;
+    std::vector<RandomizerCheck> eligibleChecks;
+    std::vector<bool> eligibleIsChest;
+    for (int i = 0; i < ACTORCAT_MAX; i++) {
+        for (Actor* actor = gPlayState->actorCtx.actorLists[i].head; actor != nullptr; actor = actor->next) {
             RandomizerCheck rc;
-            GetItemEntry drawnEntry;
+            GetItemEntry drawnEntry{};
             // Mystery-shuffled items draw as "?", not their stamped entry, so
             // seeing one reveals nothing and it must not mark. A chest still
             // shows its category under mystery, so that path runs regardless.
@@ -894,42 +909,76 @@ void CheckTrackerSeenItemsFrame() {
             if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED) {
                 continue;
             }
-            // Translucent draws don't leave usable depth, which rules out Lens
-            // chests and anything still fading in.
-            if (isChest && reinterpret_cast<EnBox*>(actor)->alpha != 255) {
-                continue;
-            }
-            // Duplicate actors resolving to one check are collected once.
-            bool alreadyQueued = false;
-            for (const auto& queued : seenProbesPending) {
-                if (queued.rc == rc) {
-                    alreadyQueued = true;
-                    break;
+            // Translucent draws leave no usable depth. alpha alone can't tell us
+            // that: EnBox_WaitOpen forces it to 255 every update, so the Lens
+            // types have to be named. Excluding them means a Lens chest never
+            // discloses, even when the player is looking straight at it through
+            // the Lens - a known gap, tracked in the PR, and the safe direction.
+            if (isChest) {
+                EnBox* box = reinterpret_cast<EnBox*>(actor);
+                if (box->alpha != 255 || box->type == ENBOX_TYPE_4 || box->type == ENBOX_TYPE_6) {
+                    continue;
                 }
             }
-            if (alreadyQueued) {
+            // Duplicate actors resolving to one check are collected once.
+            if (std::find(eligibleChecks.begin(), eligibleChecks.end(), rc) != eligibleChecks.end()) {
                 continue;
             }
-            SeenProbeRecord record{};
-            record.rc = rc;
-            record.isChest = isChest;
-            record.sceneNum = gPlayState->sceneNum;
-            record.drawnEntry = drawnEntry;
-            if (isChest) {
-                // The category the chest was drawing, taken from the entry
-                // EnBox_UpdateTexture textures from.
-                record.category = Randomizer_AdjustItemCategory(reinterpret_cast<EnBox*>(actor)->getItemEntry);
-            }
-            Vec3f centre = actor->world.pos;
-            float radius = SeenCandidateRadius(actor, isChest);
-            centre.y += radius; // models sit on their origin, so aim at the middle
-            if (!SeenBuildProbes(centre, radius, record)) {
-                continue;
-            }
-            coordinateBudget -= record.pointCount;
-            seenProbesPending.push_back(record);
+            eligible.push_back(actor);
+            eligibleChecks.push_back(rc);
+            eligibleIsChest.push_back(isChest);
         }
     }
+
+    // Round-robin the starting point so that, when there are more candidates
+    // than budget, every one of them gets sampled eventually instead of the
+    // later entries starving behind whatever the actor lists happen to yield
+    // first. A deferred candidate is simply not sampled this frame, which the
+    // evaluation pass treats as a non-match and therefore breaks its run.
+    static size_t scheduleCursor = 0;
+    const size_t candidateCount = eligible.size();
+    if (candidateCount == 0) {
+        scheduleCursor = 0;
+        return;
+    }
+    scheduleCursor %= candidateCount;
+    int coordinateBudget = kSeenMaxProbeCoordinates;
+    size_t examined = 0;
+    size_t cursor = scheduleCursor;
+    while (examined < candidateCount && coordinateBudget >= kSeenProbeMatchesRequired) {
+        Actor* actor = eligible[cursor];
+        RandomizerCheck rc = eligibleChecks[cursor];
+        bool isChest = eligibleIsChest[cursor];
+        cursor = (cursor + 1) % candidateCount;
+        examined++;
+
+        SeenProbeRecord record{};
+        record.rc = rc;
+        record.isChest = isChest;
+        record.sceneNum = gPlayState->sceneNum;
+        if (isChest) {
+            // The category the chest was drawing, taken from the entry
+            // EnBox_UpdateTexture textures from.
+            record.category = Randomizer_AdjustItemCategory(reinterpret_cast<EnBox*>(actor)->getItemEntry);
+        } else {
+            SeenItemIdentity(actor, rc, record.drawnEntry);
+        }
+        Vec3f centre = actor->world.pos;
+        float radius = SeenCandidateRadius(actor, isChest);
+        centre.y += radius; // models sit on their origin, so aim at the middle
+        if (!SeenBuildProbes(centre, radius, record)) {
+            continue;
+        }
+        if (record.pointCount > coordinateBudget) {
+            continue; // no room this frame; the round-robin will come back to it
+        }
+        coordinateBudget -= record.pointCount;
+        seenProbesPending.push_back(record);
+    }
+    seenProbeCandidatesLastFrame = static_cast<int>(candidateCount);
+    seenProbeDeferredLastFrame = static_cast<int>(candidateCount - seenProbesPending.size());
+    // Advance so a different candidate leads next frame.
+    scheduleCursor = (scheduleCursor + 1) % candidateCount;
 }
 
 // Runs from the graphics callback, where the depth buffer holds the frame built
@@ -940,19 +989,26 @@ void CheckTrackerDepthProbeFrame() {
         return;
     }
     // Interpolation can run this more than once per gameplay frame; disclosure
-    // must not be able to happen faster because the renderer is faster.
-    if (!seenProbesInFlight.empty() && seenProbesInFlightFrame != seenProbesLastEvaluated) {
+    // must not be able to happen faster because the renderer is faster. An empty
+    // batch is still evaluated - that is what resets progress when the player
+    // looks away, pauses, or the actor goes.
+    if (seenProbesInFlightValid && seenProbesInFlightFrame != seenProbesLastEvaluated) {
         seenProbesLastEvaluated = seenProbesInFlightFrame;
 
         // Queue every coordinate before reading any of them: the first read
-        // flushes the whole pending set in one round-trip to the backend.
+        // flushes the whole pending set in one round-trip to the backend. This
+        // only holds while we run ahead of the environment/glow reads, which is
+        // what the hook's placement in Environment_GraphCallback guarantees.
+        seenProbeCoordinatesLastFrame = 0;
         for (const auto& record : seenProbesInFlight) {
             for (int i = 0; i < record.pointCount; i++) {
                 OTRGetPixelDepthPrepare(record.points[i].x, record.points[i].y);
+                seenProbeCoordinatesLastFrame++;
             }
         }
 
         bool anySeen = false;
+        seenProbeMatchesLastFrame = 0;
         std::unordered_set<RandomizerCheck> matchedThisFrame;
         for (const auto& record : seenProbesInFlight) {
             if (record.sceneNum != gPlayState->sceneNum) {
@@ -972,6 +1028,7 @@ void CheckTrackerDepthProbeFrame() {
                 continue;
             }
             matchedThisFrame.insert(record.rc);
+            seenProbeMatchesLastFrame++;
             if (++seenItemFrames[record.rc] < kSeenFramesRequired) {
                 continue;
             }
@@ -1003,13 +1060,16 @@ void CheckTrackerDepthProbeFrame() {
             SaveManager::Instance->SaveSection(gSaveContext.fileNum, sectionId, true);
         }
         seenProbesInFlight.clear();
+        seenProbesInFlightValid = false;
     }
 
     // Hand this frame's evidence over to be read once its frame has rendered.
-    if (!seenProbesPending.empty()) {
+    if (seenProbesPendingValid) {
         seenProbesInFlight = std::move(seenProbesPending);
         seenProbesInFlightFrame = seenProbesPendingFrame;
+        seenProbesInFlightValid = true;
         seenProbesPending.clear();
+        seenProbesPendingValid = false;
     }
 }
 
