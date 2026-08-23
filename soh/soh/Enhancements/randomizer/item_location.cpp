@@ -149,6 +149,14 @@ RandomizerCheckStatus ItemLocation::GetCheckStatus() {
     return status;
 }
 
+void ItemLocation::SetSeenCategory(GetItemCategory seenCategory_) {
+    seenCategory = seenCategory_;
+}
+
+int16_t ItemLocation::GetSeenCategory() const {
+    return seenCategory;
+}
+
 void ItemLocation::SetIsSkipped(bool isSkipped_) {
     isSkipped = isSkipped_;
     GameInteractor::Instance->ExecuteHooks<GameInteractor::OnRandoSetIsSkipped>(rc, isSkipped);
@@ -239,6 +247,7 @@ void ItemLocation::ResetVariables() {
     barrenCandidate = false;
     areas = {};
     status = RCSHOW_UNCHECKED;
+    seenCategory = -1;
     isSkipped = false;
     isAvailable = false;
 }

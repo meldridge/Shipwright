@@ -1,6 +1,7 @@
 #pragma once
 
 #include "soh/Enhancements/custom-message/text.h"
+#include "soh/Enhancements/item-tables/ItemTableTypes.h"
 #include "static_data.h"
 #include "option.h"
 
@@ -36,6 +37,8 @@ class ItemLocation {
     bool HasObtained() const;
     void SetCheckStatus(RandomizerCheckStatus status_);
     RandomizerCheckStatus GetCheckStatus();
+    void SetSeenCategory(GetItemCategory seenCategory_);
+    int16_t GetSeenCategory() const;
     void SetIsSkipped(bool isSkipped_);
     bool GetIsSkipped();
     bool IsHintable() const;
@@ -77,6 +80,10 @@ class ItemLocation {
     bool wothCandidate = false;
     bool barrenCandidate = false;
     RandomizerCheckStatus status = RCSHOW_UNCHECKED;
+    // The category a CSMC chest was drawing when the player saw it, or -1 for
+    // none. Qualifies RCSHOW_CATEGORY: recomputing it later would track the
+    // chest's live downgrades and change what a check reports unlooked-at.
+    int16_t seenCategory = -1;
     bool isSkipped = false;
     bool isAvailable = false;
 };

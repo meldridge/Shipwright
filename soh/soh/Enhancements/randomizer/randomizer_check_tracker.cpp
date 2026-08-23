@@ -613,6 +613,16 @@ static constexpr float kSeenChestRayYOffset = 20.0f; // a chest's mid-height
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
 static std::unordered_map<RandomizerCheck, int> seenItemFrames;
 
+// What a qualifying actor was drawing this frame. Collected per check so that
+// duplicate actors sharing a check count once, and so a check whose actor went
+// away is dropped rather than resuming its old count on respawn.
+struct SeenCandidate {
+    Actor* actor;
+    GetItemEntry drawnEntry;
+    bool isChest;
+};
+static std::unordered_map<RandomizerCheck, SeenCandidate> seenCandidates;
+
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
 // rather than start marking on its own. Freestanding rupees and hearts are left
@@ -734,13 +744,24 @@ void CheckTrackerSeenItemsFrame() {
     if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO) {
         return;
     }
+    // Only Actor_DrawAll refreshes isDrawn, and Play_Draw skips it while the pause
+    // menu is up. Counting frames against that frozen state would let a glimpse
+    // finish behind the menu.
+    if (gPlayState->pauseCtx.state != 0) {
+        return;
+    }
     // Don't let a glimpse in one scene carry over into the next.
     static int16_t lastSceneNum = -1;
     if (gPlayState->sceneNum != lastSceneNum) {
         lastSceneNum = gPlayState->sceneNum;
         seenItemFrames.clear();
     }
-    bool anySeen = false;
+    // Read the CVar, not the `mystery` display cache: that one is only refreshed
+    // while the tracker window is drawing, so a closed tracker leaves it false.
+    const bool mysteryShuffle = CVarGetInteger(CVAR_RANDOMIZER_ENHANCEMENT("MysteriousShuffle"), 0);
+    // Collect this frame's qualifying checks first, so the counting pass can tell
+    // "not looked at" from "actor no longer in the list".
+    seenCandidates.clear();
     for (int i = 0; i < ACTORCAT_MAX; i++) {
         for (Actor* actor = gPlayState->actorCtx.actorLists[i].head; actor != nullptr; actor = actor->next) {
             RandomizerCheck rc;
@@ -748,40 +769,55 @@ void CheckTrackerSeenItemsFrame() {
             // Mystery-shuffled items draw as "?", not their stamped entry, so
             // seeing one reveals nothing and it must not mark. A chest still
             // shows its category under mystery, so that path runs regardless.
-            bool isItem = !mystery && SeenItemIdentity(actor, rc, drawnEntry);
+            bool isItem = !mysteryShuffle && SeenItemIdentity(actor, rc, drawnEntry);
             bool isChest = !isItem && SeenChestCategory(actor, rc);
             if (!isItem && !isChest) {
                 continue;
             }
-            auto loc = OTRGlobals::Instance->gRandoContext->GetItemLocation(rc);
-            if (loc->GetCheckStatus() != RCSHOW_UNCHECKED) {
-                seenItemFrames.erase(rc);
+            if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED) {
                 continue;
             }
             // A chest ignores its own dyna collision when testing occlusion.
             s32 ignoreBgId = isChest ? reinterpret_cast<EnBox*>(actor)->dyna.bgId : -1;
             if (!IsSeenVisible(actor, isChest ? kSeenChestRayYOffset : kSeenItemRayYOffset, ignoreBgId)) {
-                seenItemFrames.erase(rc);
                 continue;
             }
-            if (++seenItemFrames[rc] < kSeenFramesRequired) {
-                continue;
-            }
-            seenItemFrames.erase(rc);
-            if (isChest) {
-                // The chest shows only a category; the label is derived on draw.
-                loc->SetCheckStatus(RCSHOW_CATEGORY);
-                anySeen = true;
-                continue;
-            }
-            // Unobtainable items draw as a blue rupee; only mark when the drawn
-            // model matches the truth (disguises match both sides).
-            GetItemEntry truthful = OTRGlobals::Instance->gRandoContext->GetFinalGIEntry(
-                rc, false, (GetItemID)Rando::StaticData::GetLocation(rc)->GetVanillaItem());
-            if (drawnEntry.modIndex == truthful.modIndex && drawnEntry.getItemId == truthful.getItemId) {
-                loc->SetCheckStatus(RCSHOW_SEEN_OR_HINTED);
-                anySeen = true;
-            }
+            seenCandidates.insert({ rc, { actor, drawnEntry, isChest } });
+        }
+    }
+    // Anything not visible this frame starts over; the frames have to be consecutive.
+    for (auto it = seenItemFrames.begin(); it != seenItemFrames.end();) {
+        if (seenCandidates.count(it->first)) {
+            ++it;
+        } else {
+            it = seenItemFrames.erase(it);
+        }
+    }
+    bool anySeen = false;
+    for (const auto& [rc, candidate] : seenCandidates) {
+        if (++seenItemFrames[rc] < kSeenFramesRequired) {
+            continue;
+        }
+        seenItemFrames.erase(rc);
+        auto loc = OTRGlobals::Instance->gRandoContext->GetItemLocation(rc);
+        if (candidate.isChest) {
+            // Record the category off the chest's own entry, which is what
+            // EnBox_UpdateTexture textures from, so the row can't disagree
+            // with the chest the player looked at.
+            loc->SetSeenCategory(
+                Randomizer_AdjustItemCategory(reinterpret_cast<EnBox*>(candidate.actor)->getItemEntry));
+            loc->SetCheckStatus(RCSHOW_CATEGORY);
+            anySeen = true;
+            continue;
+        }
+        // Unobtainable items draw as a blue rupee; only mark when the drawn
+        // model matches the truth (disguises match both sides).
+        GetItemEntry truthful = OTRGlobals::Instance->gRandoContext->GetFinalGIEntry(
+            rc, false, (GetItemID)Rando::StaticData::GetLocation(rc)->GetVanillaItem());
+        if (candidate.drawnEntry.modIndex == truthful.modIndex &&
+            candidate.drawnEntry.getItemId == truthful.getItemId) {
+            loc->SetCheckStatus(RCSHOW_SEEN_OR_HINTED);
+            anySeen = true;
         }
     }
     if (anySeen) {
@@ -1197,6 +1233,10 @@ void SaveTrackerData(SaveContext* saveContext, int sectionID, bool fullSave) {
                 SaveManager::Instance->SaveData("randomizerCheck", check);
                 SaveManager::Instance->SaveData("status", savedStatus);
                 SaveManager::Instance->SaveData("skipped", isSkipped);
+                int16_t seenCategory = OTRGlobals::Instance->gRandoContext->GetItemLocation(check)->GetSeenCategory();
+                if (seenCategory >= 0) {
+                    SaveManager::Instance->SaveData("seenCategory", seenCategory);
+                }
             });
         }
     });
@@ -1220,9 +1260,15 @@ void LoadFile() {
             RandomizerCheckStatus status;
             bool skipped;
             RandomizerCheck rc;
+            int32_t seenCategory;
             SaveManager::Instance->LoadData("randomizerCheck", rc, RC_UNKNOWN_CHECK);
             SaveManager::Instance->LoadData("status", status, RCSHOW_UNCHECKED);
             SaveManager::Instance->LoadData("skipped", skipped, false);
+            SaveManager::Instance->LoadData("seenCategory", seenCategory, (int32_t)-1);
+            if (seenCategory >= 0) {
+                OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->SetSeenCategory(
+                    static_cast<GetItemCategory>(seenCategory));
+            }
             OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->SetCheckStatus(status);
             OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->SetIsSkipped(skipped);
         });
@@ -1240,6 +1286,7 @@ void Teardown() {
     filterAreasHidden = { 0 };
     filterChecksHidden = { 0 };
     seenItemFrames.clear();
+    seenCandidates.clear();
 
     lastLocationChecked = RC_UNKNOWN_CHECK;
 }
@@ -1605,12 +1652,12 @@ bool ShouldShowCheck(RandomizerCheck check) {
                       .GetName()
                       .GetForLanguage(gSaveContext.language);
     } else if (itemLoc->GetCheckStatus() == RCSHOW_CATEGORY) {
-        // Category-seen: searchable by category, never the item name.
-        GetItemEntry entry = OTRGlobals::Instance->gRandoContext->GetFinalGIEntry(
-            check, false, (GetItemID)Rando::StaticData::GetLocation(check)->GetVanillaItem());
-        search +=
-            " " +
-            ItemCategoryName(Randomizer_AdjustItemCategory(entry)).GetForLanguage(gSaveContext.language, MF_CLEAN);
+        // Category-seen: searchable by the category observed, never the item name.
+        int16_t seenCategory = itemLoc->GetSeenCategory();
+        if (seenCategory >= 0) {
+            search += " " + ItemCategoryName(static_cast<GetItemCategory>(seenCategory))
+                                .GetForLanguage(gSaveContext.language, MF_CLEAN);
+        }
     }
     return (IsVisibleInCheckTracker(check) &&
             (checkSearch.Filters.Size == 0 || checkSearch.PassFilter(search.c_str())));
@@ -2324,13 +2371,15 @@ void DrawLocation(RandomizerCheck rc) {
         switch (status) {
             case RCSHOW_CATEGORY: {
                 // A seen chest reveals only its category (via CSMC), so show the
-                // category the chest draws, not the item. Recomputed here so it
-                // tracks the chest's dynamic downgrades. Not mystery-gated: the
-                // chest shows the category under mystery too.
-                GetItemEntry entry = OTRGlobals::Instance->gRandoContext->GetFinalGIEntry(
-                    rc, false, (GetItemID)Rando::StaticData::GetLocation(rc)->GetVanillaItem());
-                txt = ItemCategoryName(Randomizer_AdjustItemCategory(entry))
-                          .GetForLanguage(gSaveContext.language, MF_CLEAN);
+                // category the chest drew at the time, not the item. Not
+                // mystery-gated: the chest shows its category under mystery too.
+                // A check recorded before categories were stored has none, and
+                // shows nothing rather than a guess.
+                int16_t seenCategory = itemLoc->GetSeenCategory();
+                if (seenCategory >= 0) {
+                    txt = ItemCategoryName(static_cast<GetItemCategory>(seenCategory))
+                              .GetForLanguage(gSaveContext.language, MF_CLEAN);
+                }
                 break;
             }
             case RCSHOW_SAVED:

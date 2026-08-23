@@ -27,6 +27,8 @@ void Anchor::SendPacket_SetCheckStatus(RandomizerCheck rc) {
     payload["rc"] = rc;
     payload["status"] = randoContext->GetItemLocation(rc)->GetCheckStatus();
     payload["skipped"] = randoContext->GetItemLocation(rc)->GetIsSkipped();
+    // Qualifies RCSHOW_CATEGORY; -1 when the check has no observed category.
+    payload["seenCategory"] = randoContext->GetItemLocation(rc)->GetSeenCategory();
     payload["quiet"] = true;
 
     SendJsonToRemote(payload);
@@ -46,9 +48,14 @@ void Anchor::HandlePacket_SetCheckStatus(nlohmann::json payload) {
     }
     RandomizerCheckStatus status = payload.at("status").get<RandomizerCheckStatus>();
     bool skipped = payload.at("skipped").get<bool>();
+    int16_t seenCategory = payload.value("seenCategory", (int16_t)-1);
 
     isResultOfHandling = true;
 
+    // Set before the status: RCSHOW_CATEGORY is displayed using it.
+    if (seenCategory >= 0) {
+        randoContext->GetItemLocation(rc)->SetSeenCategory(static_cast<GetItemCategory>(seenCategory));
+    }
     if (randoContext->GetItemLocation(rc)->GetCheckStatus() != status) {
         randoContext->GetItemLocation(rc)->SetCheckStatus(status);
     }

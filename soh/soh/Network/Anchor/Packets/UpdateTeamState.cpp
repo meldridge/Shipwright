@@ -55,6 +55,8 @@ void Anchor::SendPacket_UpdateTeamState() {
             // randoContext->GetItemLocation(i)->GetPlacedRandomizerGet();
             payload["state"]["rando"]["itemLocations"][i][0] = randoContext->GetItemLocation(i)->GetCheckStatus();
             payload["state"]["rando"]["itemLocations"][i][1] = (u8)randoContext->GetItemLocation(i)->GetIsSkipped();
+            // Qualifies RCSHOW_CATEGORY; -1 when the check has no observed category.
+            payload["state"]["rando"]["itemLocations"][i][2] = randoContext->GetItemLocation(i)->GetSeenCategory();
 
             // if (randoContext->GetItemLocation(i)->GetPlacedRandomizerGet() == RG_ICE_TRAP) {
             //     payload["state"]["rando"]["itemLocations"][i]["fakeRgID"] =
@@ -239,6 +241,12 @@ void Anchor::HandlePacket_UpdateTeamState(nlohmann::json payload) {
                 auto itemLocation = payload["state"]["rando"].at("itemLocations").at(i);
                 // randoContext->GetItemLocation(i)->RefPlacedItem() =
                 // itemLocation.at("rgID").get<RandomizerGet>();
+                // Set before the status: RCSHOW_CATEGORY is displayed using it.
+                int16_t seenCategory = itemLocation.size() > 2 ? itemLocation.at(2).get<int16_t>() : -1;
+                if (seenCategory >= 0) {
+                    OTRGlobals::Instance->gRandoContext->GetItemLocation(i)->SetSeenCategory(
+                        static_cast<GetItemCategory>(seenCategory));
+                }
                 OTRGlobals::Instance->gRandoContext->GetItemLocation(i)->SetCheckStatus(
                     itemLocation.at(0).get<RandomizerCheckStatus>());
                 OTRGlobals::Instance->gRandoContext->GetItemLocation(i)->SetIsSkipped(itemLocation.at(1).get<u8>());
