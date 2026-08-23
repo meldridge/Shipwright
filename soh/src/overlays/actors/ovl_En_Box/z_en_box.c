@@ -7,6 +7,9 @@
 #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
 #include "soh/Enhancements/randomizer/item_category_adj.h"
 
+// randomizer_check_tracker.h is C++ only, so declare the entry point here.
+void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex);
+
 #define FLAGS 0
 
 // movement flags
@@ -649,9 +652,13 @@ void EnBox_PostLimbDraw(PlayState* play, s32 limbIndex, Gfx** dList, Vec3s* rot,
     if (limbIndex == 1) {
         gSPMatrix((*gfx)++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
         gSPDisplayList((*gfx)++, this->boxBodyDL);
+        // These two display lists are what CSMC recolours, so they are the only
+        // surfaces that can tell the Check Tracker anything.
+        CheckTracker_RegisterChestProbes(this, limbIndex);
     } else if (limbIndex == 3) {
         gSPMatrix((*gfx)++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
         gSPDisplayList((*gfx)++, this->boxLidDL);
+        CheckTracker_RegisterChestProbes(this, limbIndex);
     }
 }
 

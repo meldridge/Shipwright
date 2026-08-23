@@ -62,3 +62,17 @@ void SpoilAreaFromCheck(RandomizerCheck rc);
 void RecalculateAvailableChecks(RandomizerRegion startingRegion = RR_ROOT, RandoAgeTime startingAgeTime = RAT_NONE);
 void LoadFromPreset(const nlohmann::json& info);
 } // namespace CheckTracker
+
+// Called from the draw paths that actually display a check's identity, while the
+// model matrix that drew it is still current. Registering here rather than by
+// scanning actor lists is what ties the evidence to a real draw submission.
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct EnBox;
+// limbIndex selects the chest's category-bearing body/lid surfaces.
+void CheckTracker_RegisterChestProbes(struct EnBox* box, int32_t limbIndex);
+void CheckTracker_RegisterItemProbes(Actor* actor, struct GetItemEntry entry);
+#ifdef __cplusplus
+}
+#endif

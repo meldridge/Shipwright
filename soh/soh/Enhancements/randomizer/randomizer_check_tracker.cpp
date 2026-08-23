@@ -618,15 +618,15 @@ static constexpr int kSeenMaxProbeCoordinates = 48;
 // recognise, whatever the depth buffer says.
 static constexpr float kSeenMinScreenRadius = 3.0f;
 
-// Bounding radii, used both to spread the probes over the model and to size the
-// depth slab. NOTE: this is proximity, not attribution - a wider radius admits
-// more unrelated geometry, and background close behind a thin model falls inside
-// the slab. Being replaced by renderer-assisted sampling of the actual drawn
-// triangles; until then these values bound a known-approximate test.
-static constexpr float kSeenRadiusChestLarge = 30.0f;
-static constexpr float kSeenRadiusChestSmall = 15.0f;
-static constexpr float kSeenRadiusItem = 12.0f;
-static constexpr float kSeenRadiusHeart = 20.0f;
+// Depth tolerance, in the same units as the sampled buffer. Only wide enough to
+// absorb rasterisation and quantisation differences between the projected point
+// and the pixel actually rasterised - not wide enough to span a model, which is
+// what made the old bounding-radius slab accept unrelated geometry. Chests get
+// the tighter value because their probes sit on known surfaces; items allow a
+// little more because the default profile is generic. Both want calibrating
+// against the overlay.
+static constexpr int32_t kSeenChestDepthTolerance = 24;
+static constexpr int32_t kSeenItemDepthTolerance = 40;
 
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
 static std::unordered_map<RandomizerCheck, int> seenItemFrames;
@@ -774,88 +774,11 @@ static bool SeenPointOnScreen(const SeenProbePoint& point) {
            point.y >= 0.0f && point.y <= SCREEN_HEIGHT;
 }
 
-// Spreads probes over a candidate's projected disc and sizes the depth slab to
-// its bounding radius. A sample landing off the model does not reliably fail:
-// anything within an actor-sized depth interval passes, including a near
-// occluder or background just behind the model. Interim approximation only.
-static bool SeenBuildProbes(const Vec3f& centre, float radius, SeenProbeRecord& record) {
-    SeenProbePoint origin;
-    if (!SeenProjectPoint(centre, origin) || !SeenPointOnScreen(origin)) {
-        return false;
-    }
-    // Camera basis, so the disc faces the viewer whatever the actor's rotation.
-    Vec3f forward = { gPlayState->view.lookAt.x - gPlayState->view.eye.x,
-                      gPlayState->view.lookAt.y - gPlayState->view.eye.y,
-                      gPlayState->view.lookAt.z - gPlayState->view.eye.z };
-    Vec3f up = gPlayState->view.up;
-    Vec3f right = { forward.y * up.z - forward.z * up.y, forward.z * up.x - forward.x * up.z,
-                    forward.x * up.y - forward.y * up.x };
-    float rightLen = sqrtf(right.x * right.x + right.y * right.y + right.z * right.z);
-    float forwardLen = sqrtf(forward.x * forward.x + forward.y * forward.y + forward.z * forward.z);
-    if (rightLen < 0.001f || forwardLen < 0.001f) {
-        return false;
-    }
-    right.x = right.x / rightLen * radius;
-    right.y = right.y / rightLen * radius;
-    right.z = right.z / rightLen * radius;
-    Vec3f screenUp = { up.x * radius, up.y * radius, up.z * radius };
-
-    // Projected radius, measured rather than derived, so it stays correct under
-    // any projection the game is using.
-    SeenProbePoint edge;
-    Vec3f edgePos = { centre.x + right.x, centre.y + right.y, centre.z + right.z };
-    if (!SeenProjectPoint(edgePos, edge)) {
-        return false;
-    }
-    float screenRadius = sqrtf((edge.x - origin.x) * (edge.x - origin.x) + (edge.y - origin.y) * (edge.y - origin.y));
-    if (screenRadius < kSeenMinScreenRadius) {
-        return false;
-    }
-
-    // Slab half-width: how much depth the candidate itself spans, taken by
-    // projecting a point one radius nearer the camera.
-    Vec3f nearer = { centre.x - forward.x / forwardLen * radius, centre.y - forward.y / forwardLen * radius,
-                     centre.z - forward.z / forwardLen * radius };
-    SeenProbePoint nearPoint;
-    if (!SeenProjectPoint(nearer, nearPoint)) {
-        return false;
-    }
-    record.slabHalfWidth = std::abs(origin.expectedZ - nearPoint.expectedZ);
-    if (record.slabHalfWidth <= 0) {
-        return false;
-    }
-
-    record.points[0] = origin;
-    record.pointCount = 1;
-    static constexpr float kSpread = 0.6f;
-    const float offsets[4][2] = {
-        { -kSpread, -kSpread }, { kSpread, -kSpread }, { -kSpread, kSpread }, { kSpread, kSpread }
-    };
-    for (const auto& offset : offsets) {
-        Vec3f pos = { centre.x + right.x * offset[0] + screenUp.x * offset[1],
-                      centre.y + right.y * offset[0] + screenUp.y * offset[1],
-                      centre.z + right.z * offset[0] + screenUp.z * offset[1] };
-        SeenProbePoint point;
-        if (SeenProjectPoint(pos, point) && SeenPointOnScreen(point)) {
-            record.points[record.pointCount++] = point;
-        }
-    }
-    // Too few on screen to ever reach the match threshold.
-    return record.pointCount >= kSeenProbeMatchesRequired;
-}
-
-// The radius used for both the probe spread and the slab.
-static float SeenCandidateRadius(Actor* actor, bool isChest) {
-    if (isChest) {
-        EnBox* box = reinterpret_cast<EnBox*>(actor);
-        return (box->type == ENBOX_TYPE_SMALL || box->type == ENBOX_TYPE_6 ||
-                box->type == ENBOX_TYPE_ROOM_CLEAR_SMALL || box->type == ENBOX_TYPE_SWITCH_FLAG_FALL_SMALL)
-                   ? kSeenRadiusChestSmall
-                   : kSeenRadiusChestLarge;
-    }
-    return actor->id == ACTOR_ITEM_B_HEART ? kSeenRadiusHeart : kSeenRadiusItem;
-}
-
+// Builds probes from model-space points transformed by whatever matrix the draw
+// is currently using, so scale, rotation and animation come from the render
+// rather than being reconstructed. Tolerance is deliberately narrow: a point
+// that does not land on the surface it was meant for fails, which is the safe
+// direction.
 // A shuffled chest currently showing its item category (CSMC), whose category
 // the player can therefore read off the chest. Mirrors EnBox_UpdateTexture's
 // gate so we only mark when the chest actually looks the part.
@@ -866,22 +789,144 @@ static bool SeenChestCategory(Actor* actor, RandomizerCheck& rc) {
         (gPlayState->sceneNum == SCENE_TREASURE_BOX_SHOP && actor->room != 6)) {
         return false;
     }
+    // Lens chests stay excluded until the surface probes are proven; their
+    // aperture is already in the depth buffer, so this is temporary.
+    EnBox* box = reinterpret_cast<EnBox*>(actor);
+    if (box->type == ENBOX_TYPE_4 || box->type == ENBOX_TYPE_6) {
+        return false;
+    }
     rc = OTRGlobals::Instance->gRandomizer->GetCheckFromActor(actor->id, gPlayState->sceneNum, actor->params);
     return rc != RC_UNKNOWN_CHECK && OTRGlobals::Instance->gRandoContext->IsLocationShuffled(rc);
 }
 
+static bool SeenBuildProbesFromMatrix(const Vec3f* modelPoints, int count, int32_t tolerance, SeenProbeRecord& record) {
+    record.pointCount = 0;
+    record.slabHalfWidth = tolerance;
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (int i = 0; i < count && record.pointCount < kSeenProbesPerCandidate; i++) {
+        Vec3f world;
+        Matrix_MultVec3f(const_cast<Vec3f*>(&modelPoints[i]), &world);
+        SeenProbePoint point;
+        if (!SeenProjectPoint(world, point) || !SeenPointOnScreen(point)) {
+            continue;
+        }
+        minX = std::min(minX, point.x);
+        maxX = std::max(maxX, point.x);
+        minY = std::min(minY, point.y);
+        maxY = std::max(maxY, point.y);
+        record.points[record.pointCount++] = point;
+    }
+    if (record.pointCount < kSeenProbeMatchesRequired) {
+        return false;
+    }
+    // Minimum on-screen extent, in N64 screen units, so a distant speck whose
+    // probes all land in one pixel cannot qualify.
+    return (maxX - minX) >= kSeenMinScreenRadius || (maxY - minY) >= kSeenMinScreenRadius;
+}
+
+// Shared by both registration paths: eligibility, de-duplication and budget.
+static bool SeenRegisterCommon(RandomizerCheck rc, SeenProbeRecord& record) {
+    if (!seenProbesPendingValid || rc == RC_UNKNOWN_CHECK) {
+        return false;
+    }
+    if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED) {
+        return false;
+    }
+    for (const auto& queued : seenProbesPending) {
+        if (queued.rc == rc) {
+            return false; // one record per check per frame
+        }
+    }
+    record.rc = rc;
+    record.sceneNum = gPlayState->sceneNum;
+    return true;
+}
+
+// Model-space probe points on the chest's category-bearing surfaces. The chest
+// skeleton puts limb 1's origin inside the body and limb 3's inside the lid, so
+// these spread across the face rather than sitting on a single point.
+static const Vec3f kChestBodyProbes[] = {
+    { 0.0f, 0.0f, 0.0f },       { -900.0f, 300.0f, 0.0f }, { 900.0f, 300.0f, 0.0f },
+    { -900.0f, -300.0f, 0.0f }, { 900.0f, -300.0f, 0.0f },
+};
+static const Vec3f kChestLidProbes[] = {
+    { 0.0f, 0.0f, 0.0f },
+    { -700.0f, 0.0f, 0.0f },
+    { 700.0f, 0.0f, 0.0f },
+};
+
+// Default world-item profile, in the item's own model space so the draw's scale
+// applies. Deliberately tight around the origin: most randomized item models are
+// solid near their centre, and a point that misses fails rather than guessing.
+static const Vec3f kItemProbes[] = {
+    { 0.0f, 0.0f, 0.0f }, { -6.0f, 4.0f, 0.0f }, { 6.0f, 4.0f, 0.0f }, { -6.0f, -4.0f, 0.0f }, { 6.0f, -4.0f, 0.0f },
+};
+
+extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) {
+    if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO || box == nullptr) {
+        return;
+    }
+    RandomizerCheck rc;
+    if (!SeenChestCategory(&box->dyna.actor, rc)) {
+        return;
+    }
+    SeenProbeRecord record{};
+    if (!SeenRegisterCommon(rc, record)) {
+        return;
+    }
+    record.isChest = true;
+    // What the chest is texturing from, captured as displayed.
+    record.category = Randomizer_AdjustItemCategory(box->getItemEntry);
+    const Vec3f* points = limbIndex == 1 ? kChestBodyProbes : kChestLidProbes;
+    int count = limbIndex == 1 ? ARRAY_COUNT(kChestBodyProbes) : ARRAY_COUNT(kChestLidProbes);
+    if (!SeenBuildProbesFromMatrix(points, count, kSeenChestDepthTolerance, record)) {
+        seenProbeRejectedLastFrame++;
+        return;
+    }
+    seenProbesPending.push_back(record);
+}
+
+extern "C" void CheckTracker_RegisterItemProbes(Actor* actor, GetItemEntry entry) {
+    if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO || actor == nullptr) {
+        return;
+    }
+    // A "?" model says nothing about the item, so it must not disclose.
+    if (CVarGetInteger(CVAR_RANDOMIZER_ENHANCEMENT("MysteriousShuffle"), 0)) {
+        return;
+    }
+    RandomizerCheck rc;
+    GetItemEntry identified;
+    if (!SeenItemIdentity(actor, rc, identified)) {
+        return;
+    }
+    SeenProbeRecord record{};
+    if (!SeenRegisterCommon(rc, record)) {
+        return;
+    }
+    record.isChest = false;
+    record.drawnEntry = entry; // the entry actually handed to GetItemEntry_Draw
+    if (!SeenBuildProbesFromMatrix(kItemProbes, ARRAY_COUNT(kItemProbes), kSeenItemDepthTolerance, record)) {
+        seenProbeRejectedLastFrame++;
+        return;
+    }
+    seenProbesPending.push_back(record);
+}
+
+// Opens this gameplay frame's batch. The records themselves arrive from the draw
+// paths during Play_Draw; nothing is collected by scanning actor lists any more,
+// so an actor that was culled or suppressed contributes no evidence at all.
 void CheckTrackerSeenItemsFrame() {
     if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO) {
         return;
     }
-    // This frame's batch exists from here on, even if nothing qualifies for it.
     seenProbesPending.clear();
     seenProbesPendingFrame = gPlayState->gameplayFrames;
     seenProbesPendingValid = true;
-    // Nothing is redrawn behind the pause menu, so the depth buffer still holds
-    // whatever was on screen before it opened. Leaving the batch empty ends any
-    // run of consecutive frames rather than freezing it.
+    seenProbeRejectedLastFrame = 0;
+    // Nothing is redrawn behind the pause menu, so leave the batch empty: that
+    // ends any run of consecutive frames rather than freezing it.
     if (gPlayState->pauseCtx.state != 0) {
+        seenProbesPendingValid = true;
         return;
     }
     // Don't let a glimpse in one scene carry over into the next.
@@ -892,112 +937,6 @@ void CheckTrackerSeenItemsFrame() {
         seenProbesInFlight.clear();
         seenProbesInFlightValid = false;
     }
-    // Read the CVar, not the `mystery` display cache: that one is only refreshed
-    // while the tracker window is drawing, so a closed tracker leaves it false.
-    const bool mysteryShuffle = CVarGetInteger(CVAR_RANDOMIZER_ENHANCEMENT("MysteriousShuffle"), 0);
-    // Gather every eligible candidate first; the budget is applied afterwards so
-    // that actor-list order can't let the same few checks monopolise it.
-    std::vector<Actor*> eligible;
-    std::vector<RandomizerCheck> eligibleChecks;
-    std::vector<bool> eligibleIsChest;
-    for (int i = 0; i < ACTORCAT_MAX; i++) {
-        for (Actor* actor = gPlayState->actorCtx.actorLists[i].head; actor != nullptr; actor = actor->next) {
-            RandomizerCheck rc;
-            GetItemEntry drawnEntry{};
-            // Mystery-shuffled items draw as "?", not their stamped entry, so
-            // seeing one reveals nothing and it must not mark. A chest still
-            // shows its category under mystery, so that path runs regardless.
-            bool isItem = !mysteryShuffle && SeenItemIdentity(actor, rc, drawnEntry);
-            bool isChest = !isItem && SeenChestCategory(actor, rc);
-            if (!isItem && !isChest) {
-                continue;
-            }
-            if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED) {
-                continue;
-            }
-            // Translucent draws leave no usable depth. alpha alone can't tell us
-            // that: EnBox_WaitOpen forces it to 255 every update, so the Lens
-            // types have to be named. Excluding them means a Lens chest never
-            // discloses, even when the player is looking straight at it through
-            // the Lens - a known gap, tracked in the PR, and the safe direction.
-            if (isChest) {
-                EnBox* box = reinterpret_cast<EnBox*>(actor);
-                if (box->alpha != 255 || box->type == ENBOX_TYPE_4 || box->type == ENBOX_TYPE_6) {
-                    continue;
-                }
-            }
-            // Duplicate actors resolving to one check are collected once.
-            if (std::find(eligibleChecks.begin(), eligibleChecks.end(), rc) != eligibleChecks.end()) {
-                continue;
-            }
-            eligible.push_back(actor);
-            eligibleChecks.push_back(rc);
-            eligibleIsChest.push_back(isChest);
-        }
-    }
-
-    // Round-robin the starting point so that, when there are more candidates
-    // than budget, every one of them gets sampled eventually instead of the
-    // later entries starving behind whatever the actor lists happen to yield
-    // first. A deferred candidate is simply not sampled this frame, which the
-    // evaluation pass treats as a non-match and therefore breaks its run.
-    const size_t candidateCount = eligible.size();
-    if (candidateCount == 0) {
-        seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
-        seenProbeCandidatesLastFrame = 0;
-        seenProbeDeferredLastFrame = 0;
-        seenProbeRejectedLastFrame = 0;
-        return;
-    }
-    // Resume after whichever check led last frame, if it is still eligible.
-    size_t startAt = 0;
-    for (size_t i = 0; i < candidateCount; i++) {
-        if (eligibleChecks[i] == seenProbeScheduleAfter) {
-            startAt = (i + 1) % candidateCount;
-            break;
-        }
-    }
-    int coordinateBudget = kSeenMaxProbeCoordinates;
-    int rejected = 0;
-    int deferred = 0;
-    size_t examined = 0;
-    size_t cursor = startAt;
-    while (examined < candidateCount && coordinateBudget >= kSeenProbeMatchesRequired) {
-        Actor* actor = eligible[cursor];
-        RandomizerCheck rc = eligibleChecks[cursor];
-        bool isChest = eligibleIsChest[cursor];
-        cursor = (cursor + 1) % candidateCount;
-        examined++;
-
-        SeenProbeRecord record{};
-        record.rc = rc;
-        record.isChest = isChest;
-        record.sceneNum = gPlayState->sceneNum;
-        if (isChest) {
-            // The category the chest was drawing, taken from the entry
-            // EnBox_UpdateTexture textures from.
-            record.category = Randomizer_AdjustItemCategory(reinterpret_cast<EnBox*>(actor)->getItemEntry);
-        } else {
-            SeenItemIdentity(actor, rc, record.drawnEntry);
-        }
-        Vec3f centre = actor->world.pos;
-        float radius = SeenCandidateRadius(actor, isChest);
-        centre.y += radius; // models sit on their origin, so aim at the middle
-        if (!SeenBuildProbes(centre, radius, record)) {
-            rejected++; // off screen, too small, or unprojectable
-            continue;
-        }
-        if (record.pointCount > coordinateBudget) {
-            deferred++; // no room this frame; the round-robin will come back to it
-            continue;
-        }
-        coordinateBudget -= record.pointCount;
-        seenProbesPending.push_back(record);
-    }
-    seenProbeCandidatesLastFrame = static_cast<int>(candidateCount);
-    seenProbeRejectedLastFrame = rejected;
-    seenProbeDeferredLastFrame = deferred;
-    seenProbeScheduleAfter = eligibleChecks[startAt];
 }
 
 // Runs from the graphics callback, where the depth buffer holds the frame built
@@ -1018,8 +957,35 @@ void CheckTrackerDepthProbeFrame() {
         // flushes the whole pending set in one round-trip to the backend. This
         // only holds while we run ahead of the environment/glow reads, which is
         // what the hook's placement in Environment_GraphCallback guarantees.
+        // Budget and fairness are applied here, where the whole frame's records
+        // are known. Resuming after the check that led last time stops the draw
+        // order deciding who never gets sampled.
+        seenProbeCandidatesLastFrame = static_cast<int>(seenProbesInFlight.size());
+        size_t startAt = 0;
+        for (size_t i = 0; i < seenProbesInFlight.size(); i++) {
+            if (seenProbesInFlight[i].rc == seenProbeScheduleAfter) {
+                startAt = (i + 1) % seenProbesInFlight.size();
+                break;
+            }
+        }
+        std::vector<size_t> sampled;
+        int coordinateBudget = kSeenMaxProbeCoordinates;
+        for (size_t n = 0; n < seenProbesInFlight.size(); n++) {
+            size_t index = (startAt + n) % seenProbesInFlight.size();
+            if (seenProbesInFlight[index].pointCount > coordinateBudget) {
+                continue; // deferred; counted below and treated as a non-match
+            }
+            coordinateBudget -= seenProbesInFlight[index].pointCount;
+            sampled.push_back(index);
+        }
+        seenProbeDeferredLastFrame = static_cast<int>(seenProbesInFlight.size() - sampled.size());
+        if (!seenProbesInFlight.empty()) {
+            seenProbeScheduleAfter = seenProbesInFlight[startAt].rc;
+        }
+
         seenProbeCoordinatesLastFrame = 0;
-        for (const auto& record : seenProbesInFlight) {
+        for (size_t index : sampled) {
+            const auto& record = seenProbesInFlight[index];
             for (int i = 0; i < record.pointCount; i++) {
                 OTRGetPixelDepthPrepare(record.points[i].x, record.points[i].y);
                 seenProbeCoordinatesLastFrame++;
@@ -1029,7 +995,8 @@ void CheckTrackerDepthProbeFrame() {
         bool anySeen = false;
         seenProbeMatchesLastFrame = 0;
         std::unordered_set<RandomizerCheck> matchedThisFrame;
-        for (const auto& record : seenProbesInFlight) {
+        for (size_t index : sampled) {
+            const auto& record = seenProbesInFlight[index];
             if (record.sceneNum != gPlayState->sceneNum) {
                 continue; // evidence belongs to a scene we have left
             }

@@ -603,6 +603,9 @@ void EnExItem_DrawRandomizedItem(EnExItem* enExItem, PlayState* play) {
     func_8002EBCC(&enExItem->actor, play, 0);
     func_8002ED80(&enExItem->actor, play, 0);
     EnItem00_CustomItemsParticles(&enExItem->actor, play, randoGetItem);
+    // Registered here, with the draw's own matrix still current, so the
+    // evidence follows the model actually submitted this frame.
+    CheckTracker_RegisterItemProbes(&enExItem->actor, randoGetItem);
     GetItemEntry_Draw(play, randoGetItem);
 }
 
@@ -635,6 +638,9 @@ void EnItem00_DrawRandomizedItem(EnItem00* enItem00, PlayState* play) {
     func_8002EBCC(&enItem00->actor, play, 0);
     func_8002ED80(&enItem00->actor, play, 0);
     EnItem00_CustomItemsParticles(&enItem00->actor, play, randoItem);
+    // Registered here, with the draw's own matrix still current, so the
+    // evidence follows the model actually submitted this frame.
+    CheckTracker_RegisterItemProbes(&enItem00->actor, randoItem);
     GetItemEntry_Draw(play, randoItem);
 }
 
@@ -646,6 +652,9 @@ void ItemBHeart_DrawRandomizedItem(ItemBHeart* itemBHeart, PlayState* play) {
     func_8002EBCC(&itemBHeart->actor, play, 0);
     func_8002ED80(&itemBHeart->actor, play, 0);
     EnItem00_CustomItemsParticles(&itemBHeart->actor, play, randoItem);
+    // Registered here, with the draw's own matrix still current, so the
+    // evidence follows the model actually submitted this frame.
+    CheckTracker_RegisterItemProbes(&itemBHeart->actor, randoItem);
     GetItemEntry_Draw(play, randoItem);
 }
 
@@ -668,6 +677,9 @@ void ItemEtcetera_DrawRandomizedItem(ItemEtcetera* itemEtcetera, PlayState* play
     EnItem00_CustomItemsParticles(&itemEtcetera->actor, play, randoItem);
     func_8002EBCC(&itemEtcetera->actor, play, 0);
     func_8002ED80(&itemEtcetera->actor, play, 0);
+    // Registered here, with the draw's own matrix still current, so the
+    // evidence follows the model actually submitted this frame.
+    CheckTracker_RegisterItemProbes(&itemEtcetera->actor, randoItem);
     GetItemEntry_Draw(play, randoItem);
 }
 
@@ -2261,6 +2273,9 @@ void EnSi_DrawRandomizedItem(EnSi* enSi, PlayState* play) {
     func_8002ED80(&enSi->actor, play, 0);
     func_8002EBCC(&enSi->actor, play, 0);
     EnItem00_CustomItemsParticles(&enSi->actor, play, randoItem);
+    // Registered here, with the draw's own matrix still current, so the
+    // evidence follows the model actually submitted this frame.
+    CheckTracker_RegisterItemProbes(&enSi->actor, randoItem);
     GetItemEntry_Draw(play, randoItem);
 }
 
