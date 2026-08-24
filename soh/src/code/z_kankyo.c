@@ -239,13 +239,17 @@ u16 Environment_GetPixelDepth(s32 x, s32 y) {
 void Environment_GraphCallback(GraphicsContext* gfxCtx, void* param) {
     PlayState* play = (PlayState*)param;
 
+    // Everything that wants a depth sample queues it first; the single read
+    // below flushes the whole set at once, and the consumers then work from the
+    // cache. Reading in the prepare phase, or queueing in the consume phase,
+    // would split that into a second round-trip to the backend.
     OTRGetPixelDepthPrepare(D_8015FD7E, D_8015FD80);
     Lights_GlowCheckPrepare(play);
-    // Must stay ahead of the first read below: that one flushes every queued
-    // coordinate at once, so listeners here get their samples for free.
-    GameInteractor_ExecuteOnGraphCallback();
+    GameInteractor_ExecuteOnGraphCallbackPrepare();
 
     D_8011FB44 = Environment_GetPixelDepth(D_8015FD7E, D_8015FD80);
+
+    GameInteractor_ExecuteOnGraphCallbackConsume();
     Lights_GlowCheck(play);
 }
 

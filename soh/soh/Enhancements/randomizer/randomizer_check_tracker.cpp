@@ -962,10 +962,16 @@ void CheckTrackerSeenItemsFrame() {
     }
 }
 
-// Runs from the graphics callback, where the depth buffer holds the frame built
-// during the previous gameplay update - which is why the records evaluated here
-// are that update's, not the ones just queued.
-void CheckTrackerDepthProbeFrame() {
+// Which records the prepare phase queued coordinates for, held until consume.
+static std::vector<size_t> seenProbesSampled;
+static bool seenProbesAwaitingConsume = false;
+
+// Prepare phase: queue coordinates only, never read. The depth buffer here holds
+// the frame built during the previous gameplay update, which is why the records
+// used are that update's rather than the ones just registered.
+void CheckTrackerDepthProbePrepare() {
+    seenProbesSampled.clear();
+    seenProbesAwaitingConsume = false;
     if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO) {
         return;
     }
@@ -974,12 +980,7 @@ void CheckTrackerDepthProbeFrame() {
     // batch is still evaluated - that is what resets progress when the player
     // looks away, pauses, or the actor goes.
     if (seenProbesInFlightValid && seenProbesInFlightFrame != seenProbesLastEvaluated) {
-        seenProbesLastEvaluated = seenProbesInFlightFrame;
-
-        // Queue every coordinate before reading any of them: the first read
-        // flushes the whole pending set in one round-trip to the backend. This
-        // only holds while we run ahead of the environment/glow reads, which is
-        // what the hook's placement in Environment_GraphCallback guarantees.
+        seenProbesAwaitingConsume = true;
         // Budget and fairness are applied here, where the whole frame's records
         // are known. Resuming after the check that led last time stops the draw
         // order deciding who never gets sampled.
@@ -991,7 +992,6 @@ void CheckTrackerDepthProbeFrame() {
                 break;
             }
         }
-        std::vector<size_t> sampled;
         int coordinateBudget = kSeenMaxProbeCoordinates;
         for (size_t n = 0; n < seenProbesInFlight.size(); n++) {
             size_t index = (startAt + n) % seenProbesInFlight.size();
@@ -999,21 +999,34 @@ void CheckTrackerDepthProbeFrame() {
                 continue; // deferred; counted below and treated as a non-match
             }
             coordinateBudget -= seenProbesInFlight[index].pointCount;
-            sampled.push_back(index);
+            seenProbesSampled.push_back(index);
         }
-        seenProbeDeferredLastFrame = static_cast<int>(seenProbesInFlight.size() - sampled.size());
+        seenProbeDeferredLastFrame = static_cast<int>(seenProbesInFlight.size() - seenProbesSampled.size());
         if (!seenProbesInFlight.empty()) {
             seenProbeScheduleAfter = seenProbesInFlight[startAt].rc;
         }
 
         seenProbeCoordinatesLastFrame = 0;
-        for (size_t index : sampled) {
+        for (size_t index : seenProbesSampled) {
             const auto& record = seenProbesInFlight[index];
             for (int i = 0; i < record.pointCount; i++) {
                 OTRGetPixelDepthPrepare(record.points[i].x, record.points[i].y);
                 seenProbeCoordinatesLastFrame++;
             }
         }
+    }
+}
+
+// Consume phase: runs after the environment's read has flushed the whole pending
+// set, so every value here comes from that one round-trip.
+void CheckTrackerDepthProbeConsume() {
+    if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO) {
+        return;
+    }
+    if (seenProbesAwaitingConsume) {
+        seenProbesAwaitingConsume = false;
+        seenProbesLastEvaluated = seenProbesInFlightFrame;
+        const std::vector<size_t>& sampled = seenProbesSampled;
 
         bool anySeen = false;
         seenProbeMatchesLastFrame = 0;
@@ -3146,7 +3159,8 @@ void CheckTrackerWindow::InitElement() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnDialogMessage>(CheckTrackerDialogMessage);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnRandoHintRevealed>(CheckTrackerHintRevealed);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGameFrameUpdate>(CheckTrackerSeenItemsFrame);
-    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGraphCallback>(CheckTrackerDepthProbeFrame);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGraphCallbackPrepare>(CheckTrackerDepthProbePrepare);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGraphCallbackConsume>(CheckTrackerDepthProbeConsume);
 }
 
 void CheckTrackerWindow::UpdateElement() {

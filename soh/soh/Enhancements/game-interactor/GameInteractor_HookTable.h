@@ -53,10 +53,15 @@ DEFINE_HOOK(OnPlayerShieldControl, (float* sp50, float* sp54));
 DEFINE_HOOK(OnPlayDestroy, ());
 DEFINE_HOOK(OnPlayDrawBegin, ());
 DEFINE_HOOK(OnPlayDrawEnd, ());
-// Fired from the graphics callback, where the last completed frame's depth
-// buffer can be sampled. Runs before the first OTRGetPixelDepth of the frame,
-// so listeners share that single readback rather than forcing another.
-DEFINE_HOOK(OnGraphCallback, ());
+// Two phases around the one depth readback the frame performs, in the graphics
+// callback where the last completed frame's depth buffer can be sampled.
+// Prepare listeners may only queue coordinates via OTRGetPixelDepthPrepare;
+// calling OTRGetPixelDepth here would flush early and split the batch. Consume
+// listeners may only read, and must not introduce new coordinates, which would
+// force a second readback. Between them, Environment_GetPixelDepth performs the
+// single flush that serves everyone.
+DEFINE_HOOK(OnGraphCallbackPrepare, ());
+DEFINE_HOOK(OnGraphCallbackConsume, ());
 DEFINE_HOOK(OnVanillaBehavior, (GIVanillaBehavior flag, bool* result, va_list originalArgs));
 DEFINE_HOOK(OnSaveFile, (int32_t fileNum, int32_t sectionID));
 DEFINE_HOOK(OnLoadFile, (int32_t fileNum));

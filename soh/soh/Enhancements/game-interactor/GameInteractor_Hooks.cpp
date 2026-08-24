@@ -241,8 +241,12 @@ void GameInteractor_ExecuteOnPlayDrawEnd() {
     GameInteractor::Instance->ExecuteHooks<GameInteractor::OnPlayDrawEnd>();
 }
 
-void GameInteractor_ExecuteOnGraphCallback() {
-    GameInteractor::Instance->ExecuteHooks<GameInteractor::OnGraphCallback>();
+void GameInteractor_ExecuteOnGraphCallbackPrepare() {
+    GameInteractor::Instance->ExecuteHooks<GameInteractor::OnGraphCallbackPrepare>();
+}
+
+void GameInteractor_ExecuteOnGraphCallbackConsume() {
+    GameInteractor::Instance->ExecuteHooks<GameInteractor::OnGraphCallbackConsume>();
 }
 
 bool GameInteractor_Should(GIVanillaBehavior flag, u32 result, ...) {
