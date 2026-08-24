@@ -675,6 +675,29 @@ static int seenProbeMatchesLastFrame = 0;
 // the actor lists every frame and its order is not stable.
 static RandomizerCheck seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
 
+// Snapshot of the last evaluated batch, kept only while the overlay is open.
+// The probe geometry and tolerances are guesses until they are calibrated
+// against this, so it shows every number the decision was made from.
+struct SeenProbeDebugPoint {
+    float x;
+    float y;
+    int32_t expectedZ;
+    int32_t sampledZ;
+    bool matched;
+};
+struct SeenProbeDebugRecord {
+    RandomizerCheck rc;
+    bool isChest;
+    bool wasSampled; // false means deferred for want of budget
+    int matches;
+    int32_t tolerance;
+    int pointCount;
+    int framesBanked;
+    SeenProbeDebugPoint points[kSeenProbesPerCandidate];
+};
+static std::vector<SeenProbeDebugRecord> seenProbeDebug;
+static uint32_t seenProbeDebugFrame = 0;
+
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
 // rather than start marking on its own. Freestanding rupees and hearts are left
@@ -994,21 +1017,56 @@ void CheckTrackerDepthProbeFrame() {
 
         bool anySeen = false;
         seenProbeMatchesLastFrame = 0;
+        const bool debugging = CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) != 0;
+        if (debugging) {
+            seenProbeDebug.clear();
+            seenProbeDebugFrame = seenProbesInFlightFrame;
+            // Deferred records are recorded too: "why did nothing happen" is
+            // usually answered by budget, not by the depth comparison.
+            std::unordered_set<size_t> sampledSet(sampled.begin(), sampled.end());
+            for (size_t i = 0; i < seenProbesInFlight.size(); i++) {
+                if (sampledSet.count(i) == 0) {
+                    SeenProbeDebugRecord entry{};
+                    entry.rc = seenProbesInFlight[i].rc;
+                    entry.isChest = seenProbesInFlight[i].isChest;
+                    entry.wasSampled = false;
+                    entry.tolerance = seenProbesInFlight[i].slabHalfWidth;
+                    entry.pointCount = seenProbesInFlight[i].pointCount;
+                    seenProbeDebug.push_back(entry);
+                }
+            }
+        }
         std::unordered_set<RandomizerCheck> matchedThisFrame;
         for (size_t index : sampled) {
             const auto& record = seenProbesInFlight[index];
             if (record.sceneNum != gPlayState->sceneNum) {
                 continue; // evidence belongs to a scene we have left
             }
+            SeenProbeDebugRecord entry{};
             int matches = 0;
             for (int i = 0; i < record.pointCount; i++) {
                 int32_t sampled = OTRGetPixelDepth(record.points[i].x, record.points[i].y) * 4 >> 3;
-                // Passes when some depth-writing surface lies within an
-                // actor-sized interval of the candidate's centre. That is not
-                // proof the candidate wrote it - see the note on the radii.
-                if (std::abs(sampled - record.points[i].expectedZ) <= record.slabHalfWidth) {
+                // Passes only when the sampled depth is within rasterisation
+                // tolerance of where this surface was projected to be.
+                bool matched = std::abs(sampled - record.points[i].expectedZ) <= record.slabHalfWidth;
+                if (matched) {
                     matches++;
                 }
+                if (debugging) {
+                    entry.points[i] = { record.points[i].x, record.points[i].y, record.points[i].expectedZ, sampled,
+                                        matched };
+                }
+            }
+            if (debugging) {
+                entry.rc = record.rc;
+                entry.isChest = record.isChest;
+                entry.wasSampled = true;
+                entry.matches = matches;
+                entry.tolerance = record.slabHalfWidth;
+                entry.pointCount = record.pointCount;
+                auto banked = seenItemFrames.find(record.rc);
+                entry.framesBanked = banked == seenItemFrames.end() ? 0 : banked->second;
+                seenProbeDebug.push_back(entry);
             }
             if (matches < kSeenProbeMatchesRequired) {
                 continue;
@@ -2886,6 +2944,52 @@ void CheckTrackerWindow::Draw() {
     SyncVisibilityConsoleVariable();
 }
 
+// Everything the sight-disclosure decision was made from, for calibrating the
+// probe geometry and tolerances against real scenes instead of screenshots.
+static void DrawSeenProbeOverlay() {
+    if (!ImGui::CollapsingHeader("Sight Disclosure Probes (debug)")) {
+        return;
+    }
+    UIWidgets::CVarCheckbox("Capture probe diagnostics", CVAR_TRACKER_CHECK("ProbeOverlay"),
+                            UIWidgets::CheckboxOptions()
+                                .Color(THEME_COLOR)
+                                .Tooltip("Records what each depth probe sampled. Costs nothing while closed."));
+    if (!CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0)) {
+        return;
+    }
+    ImGui::Text("Gameplay frame %u | candidates %d | coordinates %d / %d", seenProbeDebugFrame,
+                seenProbeCandidatesLastFrame, seenProbeCoordinatesLastFrame, kSeenMaxProbeCoordinates);
+    ImGui::Text("rejected (no useful projection) %d | deferred (no budget) %d | matched %d", seenProbeRejectedLastFrame,
+                seenProbeDeferredLastFrame, seenProbeMatchesLastFrame);
+    ImGui::Text("frames required %d | chest tolerance %d | item tolerance %d", kSeenFramesRequired,
+                kSeenChestDepthTolerance, kSeenItemDepthTolerance);
+    ImGui::Separator();
+    if (seenProbeDebug.empty()) {
+        ImGui::TextUnformatted("No candidates registered by a draw this frame.");
+        return;
+    }
+    for (const auto& entry : seenProbeDebug) {
+        const char* name = Rando::StaticData::GetLocation(entry.rc)->GetShortName().c_str();
+        if (!entry.wasSampled) {
+            ImGui::Text("%s [%s] deferred - no coordinate budget", name, entry.isChest ? "chest" : "item");
+            continue;
+        }
+        ImGui::Text("%s [%s] %d/%d matched (need %d), banked %d/%d", name, entry.isChest ? "chest" : "item",
+                    entry.matches, entry.pointCount, kSeenProbeMatchesRequired, entry.framesBanked,
+                    kSeenFramesRequired);
+        ImGui::Indent();
+        for (int i = 0; i < entry.pointCount; i++) {
+            const auto& point = entry.points[i];
+            // delta is the number that matters when tuning: if these cluster
+            // just outside the tolerance, the probe geometry is wrong, not the
+            // tolerance.
+            ImGui::Text("(%6.1f,%6.1f) expected %6d sampled %6d delta %6d %s", point.x, point.y, point.expectedZ,
+                        point.sampledZ, point.sampledZ - point.expectedZ, point.matched ? "PASS" : "fail");
+        }
+        ImGui::Unindent();
+    }
+}
+
 void CheckTrackerSettingsWindow::DrawElement() {
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, { 8.0f, 8.0f });
     if (ImGui::BeginTable("CheckTrackerSettingsTable", 2, ImGuiTableFlags_BordersH | ImGuiTableFlags_BordersV)) {
@@ -2937,6 +3041,7 @@ void CheckTrackerSettingsWindow::DrawElement() {
                                             .DefaultIndex(TRACKER_COMBO_BUTTON_L));
             }
         }
+        DrawSeenProbeOverlay();
         ImGui::BeginDisabled(CVarGetInteger(CVAR_SETTING("DisableChanges"), 0));
         SohGui::GetSohMenu()->MenuDrawItem(dungeonSpoilerWidget,
                                            static_cast<uint32_t>(ImGui::GetContentRegionAvail().x), THEME_COLOR);
