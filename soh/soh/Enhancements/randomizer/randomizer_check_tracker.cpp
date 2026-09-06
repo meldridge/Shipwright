@@ -649,6 +649,9 @@ static std::unordered_map<RandomizerCheck, int> seenItemFrames;
 struct SeenProbePoint {
     float x;
     float y;
+    // x squeezed into the native field the depth sampler assumes. See
+    // SeenProjectPoint: sample with this, display and bound with x.
+    float sampleX;
     int32_t expectedZ;
     // Depth of the candidate's own front surface on the line to the eye. Chests
     // accept the band between the two; items still use expectedZ alone.
@@ -825,6 +828,13 @@ static bool SeenProjectPoint(const Vec3f& world, SeenProbePoint& out) {
     out.y = projected.y * w * 120.0f + 120.0f;
     out.expectedZ = static_cast<int32_t>((projected.z * w) * 16352.0f) + 16352;
     out.nearZ = out.expectedZ; // callers with a real boundary overwrite this
+    // The depth sampler stretches the native SCREEN_WIDTH field across the whole
+    // framebuffer, while a widescreen projection puts the visible edges outside
+    // that field. Squeeze x back before sampling or every off-centre probe reads
+    // the wrong column, by more the further it sits from screen centre.
+    float left = OTRGetDimensionFromLeftEdge(0.0f);
+    float right = OTRGetDimensionFromRightEdge(SCREEN_WIDTH);
+    out.sampleX = right > left ? (out.x - left) / (right - left) * SCREEN_WIDTH : out.x;
     return true;
 }
 
@@ -1032,11 +1042,10 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
     Vec3f up = { right.y * forward.z - right.z * forward.y, right.z * forward.x - right.x * forward.z,
                  right.x * forward.y - right.y * forward.x };
 
-    // Centre, plus four points out towards where the cross-section meets the box.
-    // The box bounds the chest including its rounded lid, so the silhouette is
-    // narrower than the box at any given cross-section; measured at 0.5 the top
-    // and side probes sat on the lid curve and the body edge.
-    const float kSpreadFraction = 0.35f;
+    // Centre, plus four points half way out to where the cross-section meets the
+    // box. Half keeps them inside the silhouette at oblique angles, since the box
+    // bounds the chest including its rounded lid.
+    const float kSpreadFraction = 0.5f;
     Vec3f offsets[kSeenProbesPerCandidate];
     int count = 0;
     offsets[count++] = { 0.0f, 0.0f, 0.0f };
@@ -1296,7 +1305,7 @@ void CheckTrackerDepthProbePrepare() {
         for (size_t index : seenProbesSampled) {
             const auto& record = seenProbesInFlight[index];
             for (int i = 0; i < record.pointCount; i++) {
-                OTRGetPixelDepthPrepare(record.points[i].x, record.points[i].y);
+                OTRGetPixelDepthPrepare(record.points[i].sampleX, record.points[i].y);
                 seenProbeCoordinatesLastFrame++;
             }
         }
@@ -1344,7 +1353,7 @@ void CheckTrackerDepthProbeConsume() {
             SeenProbeDebugRecord entry{};
             int matches = 0;
             for (int i = 0; i < record.pointCount; i++) {
-                int32_t sampled = OTRGetPixelDepth(record.points[i].x, record.points[i].y) * 4 >> 3;
+                int32_t sampled = OTRGetPixelDepth(record.points[i].sampleX, record.points[i].y) * 4 >> 3;
                 // A chest accepts the band from its own front surface back to the
                 // interior probe: nearer than that is an occluder, further means the
                 // probe saw past the model. slabHalfWidth covers projection and
