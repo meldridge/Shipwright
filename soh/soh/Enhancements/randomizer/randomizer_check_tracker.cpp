@@ -721,7 +721,11 @@ static uint32_t seenProbeDebugFrame = 0;
 struct SeenChestGeometryDebug {
     RandomizerCheck rc;
     int32_t bgId;
-    const char* colReason; // null once the collision lookup is usable
+    const char* colReason;   // null once the collision lookup is usable
+    const char* probeReason; // why probe building gave up, null if it did not
+    int projected;           // probes that landed on screen
+    float spanX;             // achieved screen span, N64 units
+    float spanY;
     Vec3s minBounds;
     Vec3s maxBounds;
     Vec3f centre;     // model units
@@ -996,10 +1000,18 @@ static bool SeenObbExitDistance(const SeenChestObb& obb, const Vec3f& from, cons
 // happens to point at the camera. Each probe carries the depth of the chest's own
 // front surface along its line to the eye, which is what makes the accepted band
 // track the non-linear depth curve at that probe's distance.
-static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record) {
+static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestGeometryDebug* diag) {
+    // "Rejected" bundles several unrelated causes, and telling them apart is the
+    // difference between "too far away" and "the geometry is wrong".
+    auto give_up = [diag](const char* why) {
+        if (diag != nullptr) {
+            diag->probeReason = why;
+        }
+        return false;
+    };
     SeenChestObb obb;
     if (!SeenBuildChestObb(box, obb)) {
-        return false;
+        return give_up("collision unusable");
     }
     // Same view the projection uses, so cutscene and quake camera offsets agree.
     const View& view = gPlayState->view;
@@ -1007,14 +1019,14 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record) {
     Vec3f forward = { view.lookAt.x - eye.x, view.lookAt.y - eye.y, view.lookAt.z - eye.z };
     float length = SeenVecLength(forward);
     if (!(length > 0.001f)) {
-        return false;
+        return give_up("camera basis degenerate");
     }
     forward = { forward.x / length, forward.y / length, forward.z / length };
     Vec3f right = { forward.y * view.up.z - forward.z * view.up.y, forward.z * view.up.x - forward.x * view.up.z,
                     forward.x * view.up.y - forward.y * view.up.x };
     length = SeenVecLength(right);
     if (!(length > 0.001f)) {
-        return false;
+        return give_up("camera basis degenerate");
     }
     right = { right.x / length, right.y / length, right.z / length };
     Vec3f up = { right.y * forward.z - right.z * forward.y, right.z * forward.x - right.x * forward.z,
@@ -1032,7 +1044,7 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record) {
     for (const Vec3f& dir : spread) {
         float reach;
         if (count >= kSeenProbesPerCandidate || !SeenObbExitDistance(obb, obb.centre, dir, reach)) {
-            return false;
+            return give_up("cross-section missed the box");
         }
         reach *= kSpreadFraction;
         offsets[count++] = { dir.x * reach, dir.y * reach, dir.z * reach };
@@ -1070,10 +1082,20 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record) {
         maxY = std::max(maxY, point.y);
         record.points[record.pointCount++] = point;
     }
-    if (record.pointCount < kSeenProbeMatchesRequired) {
-        return false;
+    float spanX = record.pointCount > 0 ? maxX - minX : 0.0f;
+    float spanY = record.pointCount > 0 ? maxY - minY : 0.0f;
+    if (diag != nullptr) {
+        diag->projected = record.pointCount;
+        diag->spanX = spanX;
+        diag->spanY = spanY;
     }
-    return (maxX - minX) >= kSeenMinScreenRadius || (maxY - minY) >= kSeenMinScreenRadius;
+    if (record.pointCount < kSeenProbeMatchesRequired) {
+        return give_up("too few probes on screen");
+    }
+    if (spanX < kSeenMinScreenRadius && spanY < kSeenMinScreenRadius) {
+        return give_up("screen span below minimum");
+    }
+    return true;
 }
 
 // Default world-item profile, in the item's own model space so the draw's scale
@@ -1137,8 +1159,10 @@ extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) 
         return;
     }
     // Ahead of the eligibility checks, so a chest that dedups out is still measurable.
-    if (limbIndex == 1 && CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0)) {
+    int diagIndex = -1;
+    if (CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0)) {
         SeenCaptureChestGeometry(box, rc);
+        diagIndex = static_cast<int>(seenChestGeometryDebug.size()) - 1;
     }
     SeenProbeRecord record{};
     if (!SeenRegisterCommon(rc, record)) {
@@ -1148,7 +1172,7 @@ extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) 
     record.slabHalfWidth = kSeenChestDepthTolerance;
     // What the chest is texturing from, captured as displayed.
     record.category = Randomizer_AdjustItemCategory(box->getItemEntry);
-    if (!SeenBuildChestProbes(box, record)) {
+    if (!SeenBuildChestProbes(box, record, diagIndex >= 0 ? &seenChestGeometryDebug[diagIndex] : nullptr)) {
         seenProbeRejectedLastFrame++;
         return;
     }
@@ -3246,7 +3270,9 @@ void CheckTrackerWindow::Draw() {
 // not. Widescreen shows more than the native 320 field, so the horizontal span
 // has to come from the active edges rather than 0..SCREEN_WIDTH.
 static void SeenDrawProbeMarkers() {
-    if (seenProbeDebug.empty()) {
+    // Driven from UpdateElement, which runs every frame whether or not the tracker
+    // window is open, so the markers stay visible while playing.
+    if (!CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) || seenProbeDebug.empty()) {
         return;
     }
     float left = OTRGetDimensionFromLeftEdge(0.0f);
@@ -3333,6 +3359,10 @@ static void DrawSeenProbeOverlay() {
                     geom.root.pos.z - geom.dyna.pos.z);
         ImGui::Text("root rot (%6d,%6d,%6d) dyna rot (%6d,%6d,%6d)", geom.root.rot.x, geom.root.rot.y, geom.root.rot.z,
                     geom.dyna.rot.x, geom.dyna.rot.y, geom.dyna.rot.z);
+        if (geom.probeReason != nullptr) {
+            ImGui::Text("REJECTED: %s - %d/%d probes on screen, span %.1f x %.1f (need %.1f)", geom.probeReason,
+                        geom.projected, kSeenProbesPerCandidate, geom.spanX, geom.spanY, kSeenMinScreenRadius);
+        }
         ImGui::Unindent();
     }
     if (!seenChestGeometryDebug.empty()) {
@@ -3363,7 +3393,6 @@ static void DrawSeenProbeOverlay() {
         }
         ImGui::Unindent();
     }
-    SeenDrawProbeMarkers();
 }
 
 void CheckTrackerSettingsWindow::DrawElement() {
@@ -3527,6 +3556,9 @@ void CheckTrackerWindow::InitElement() {
 }
 
 void CheckTrackerWindow::UpdateElement() {
+    // Runs every frame regardless of the window's visibility, which is what keeps
+    // the probe markers on screen while the menu is closed.
+    SeenDrawProbeMarkers();
 }
 
 void RegisterCheckTrackerWidgets() {
