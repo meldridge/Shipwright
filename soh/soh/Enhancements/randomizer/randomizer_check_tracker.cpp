@@ -668,6 +668,7 @@ struct SeenProbeRecord {
     GetItemEntry drawnEntry;
     int32_t slabHalfWidth;
     int16_t sceneNum;
+    float distance; // camera to candidate centre, diagnostics only
     int pointCount;
     SeenProbePoint points[kSeenProbesPerCandidate];
 };
@@ -713,6 +714,7 @@ struct SeenProbeDebugRecord {
     int32_t tolerance;
     int pointCount;
     int framesBanked;
+    float distance;
     SeenProbeDebugPoint points[kSeenProbesPerCandidate];
 };
 static std::vector<SeenProbeDebugRecord> seenProbeDebug;
@@ -729,6 +731,8 @@ struct SeenChestGeometryDebug {
     int projected;           // probes that landed on screen
     float spanX;             // achieved screen span, N64 units
     float spanY;
+    float distance; // camera to AABB centre, euclidean
+    float axial;    // the same, projected onto the view axis: what depth is a function of
     Vec3s minBounds;
     Vec3s maxBounds;
     Vec3f centre;     // model units
@@ -737,6 +741,33 @@ struct SeenChestGeometryDebug {
     ScaleRotPos root; // placement as Actor_Draw builds it
 };
 static std::vector<SeenChestGeometryDebug> seenChestGeometryDebug;
+
+// What a depth tolerance actually admits, in world units. Depth is non-linear,
+// so a constant number of depth units is a window that grows with the square of
+// the viewing distance: sub-unit slop up close, hundreds of units far away.
+// Derived rather than stored, so it cannot disagree with the tolerance it came
+// from.
+static float SeenDepthWindowWorld(float distance, int32_t tolerance) {
+    if (gPlayState == nullptr || !(distance > 0.0f)) {
+        return 0.0f;
+    }
+    return tolerance * distance * distance / (16352.0f * 2.0f * gPlayState->view.zNear);
+}
+
+// Inverse of the depth encoding in SeenProjectPoint: the axial depth a stored
+// value corresponds to. Only the projection's own near/far are involved, so a
+// disagreement with the measured geometry means the two are not describing the
+// same point.
+static float SeenDepthToAxial(int32_t depth) {
+    if (gPlayState == nullptr) {
+        return 0.0f;
+    }
+    float zn = gPlayState->view.zNear;
+    float zf = gPlayState->view.zFar;
+    float ndc = (depth - 16352.0f) / 16352.0f;
+    float denom = (zn + zf) / (zf - zn) - ndc;
+    return denom > 1e-6f ? (2.0f * zn * zf / (zf - zn)) / denom : 0.0f;
+}
 
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
@@ -845,6 +876,10 @@ static bool SeenPointOnScreen(const SeenProbePoint& point) {
            point.y >= 0.0f && point.y <= SCREEN_HEIGHT;
 }
 
+static float SeenVecLength(const Vec3f& v) {
+    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
 // Builds probes from model-space points transformed by whatever matrix the draw
 // is currently using, so scale, rotation and animation come from the render
 // rather than being reconstructed. Tolerance is deliberately narrow: a point
@@ -880,6 +915,10 @@ static bool SeenBuildProbesFromMatrix(const Vec3f* modelPoints, int count, int32
         SeenProbePoint point;
         if (!SeenProjectPoint(world, point) || !SeenPointOnScreen(point)) {
             continue;
+        }
+        if (record.pointCount == 0) {
+            const Vec3f& eye = gPlayState->view.eye;
+            record.distance = SeenVecLength({ world.x - eye.x, world.y - eye.y, world.z - eye.z });
         }
         minX = std::min(minX, point.x);
         maxX = std::max(maxX, point.x);
@@ -927,10 +966,6 @@ struct SeenChestObb {
     Vec3f axis[3]; // unit, world
     float half[3]; // world
 };
-
-static float SeenVecLength(const Vec3f& v) {
-    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
-}
 
 static bool SeenBuildChestObb(EnBox* box, SeenChestObb& obb) {
     Actor* actor = &box->dyna.actor;
@@ -1026,6 +1061,12 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
     // Same view the projection uses, so cutscene and quake camera offsets agree.
     const View& view = gPlayState->view;
     Vec3f eye = view.eye;
+    // Recorded before the basis checks so a rejected candidate still reports how
+    // far away it was.
+    record.distance = SeenVecLength({ obb.centre.x - eye.x, obb.centre.y - eye.y, obb.centre.z - eye.z });
+    if (diag != nullptr) {
+        diag->distance = record.distance;
+    }
     Vec3f forward = { view.lookAt.x - eye.x, view.lookAt.y - eye.y, view.lookAt.z - eye.z };
     float length = SeenVecLength(forward);
     if (!(length > 0.001f)) {
@@ -1041,6 +1082,12 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
     right = { right.x / length, right.y / length, right.z / length };
     Vec3f up = { right.y * forward.z - right.z * forward.y, right.z * forward.x - right.x * forward.z,
                  right.x * forward.y - right.y * forward.x };
+    if (diag != nullptr) {
+        // expectedZ is a function of this, not of the euclidean distance; the two
+        // differ by the off-axis angle and nothing else.
+        diag->axial = (obb.centre.x - eye.x) * forward.x + (obb.centre.y - eye.y) * forward.y +
+                      (obb.centre.z - eye.z) * forward.z;
+    }
 
     // Centre, plus four points half way out to where the cross-section meets the
     // box. Half keeps them inside the silhouette at oblique angles, since the box
@@ -1340,6 +1387,7 @@ void CheckTrackerDepthProbeConsume() {
                     entry.wasSampled = false;
                     entry.tolerance = seenProbesInFlight[i].slabHalfWidth;
                     entry.pointCount = seenProbesInFlight[i].pointCount;
+                    entry.distance = seenProbesInFlight[i].distance;
                     seenProbeDebug.push_back(entry);
                 }
             }
@@ -1384,6 +1432,7 @@ void CheckTrackerDepthProbeConsume() {
                 entry.matches = matches;
                 entry.tolerance = record.slabHalfWidth;
                 entry.pointCount = record.pointCount;
+                entry.distance = record.distance;
                 auto banked = seenItemFrames.find(record.rc);
                 entry.framesBanked = banked == seenItemFrames.end() ? 0 : banked->second;
                 seenProbeDebug.push_back(entry);
@@ -3368,6 +3417,8 @@ static void DrawSeenProbeOverlay() {
                     geom.root.pos.z - geom.dyna.pos.z);
         ImGui::Text("root rot (%6d,%6d,%6d) dyna rot (%6d,%6d,%6d)", geom.root.rot.x, geom.root.rot.y, geom.root.rot.z,
                     geom.dyna.rot.x, geom.dyna.rot.y, geom.dyna.rot.z);
+        ImGui::Text("dist %.0f euclid, %.0f axial, window +/-%.0f world units", geom.distance, geom.axial,
+                    SeenDepthWindowWorld(geom.axial, kSeenChestDepthTolerance));
         if (geom.probeReason != nullptr) {
             ImGui::Text("REJECTED: %s - %d/%d probes on screen, span %.1f x %.1f (need %.1f)", geom.probeReason,
                         geom.projected, kSeenProbesPerCandidate, geom.spanX, geom.spanY, kSeenMinScreenRadius);
@@ -3392,6 +3443,11 @@ static void DrawSeenProbeOverlay() {
                     entry.matches, entry.pointCount, kSeenProbeMatchesRequired, entry.framesBanked, kSeenFramesRequired,
                     peak == seenProbePeakBanked.end() ? 0 : peak->second);
         ImGui::Indent();
+        // If "expected implies" disagrees with the measured distance, the probe and
+        // the geometry it was built from are not the same point.
+        ImGui::Text("dist %.0f euclid, expected implies %.0f axial, window +/-%.0f world units", entry.distance,
+                    entry.pointCount > 0 ? SeenDepthToAxial(entry.points[0].expectedZ) : 0.0f,
+                    SeenDepthWindowWorld(entry.distance, entry.tolerance));
         for (int i = 0; i < entry.pointCount; i++) {
             const auto& point = entry.points[i];
             // For a chest the accepted band is [near, expected]; sampled should sit
