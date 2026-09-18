@@ -631,15 +631,21 @@ static int SeenProbeBudget() {
     return kSeenMaxProbeCoordinates;
 }
 
-// Depth tolerance, in the same units as the sampled buffer. Only wide enough to
-// absorb rasterisation and quantisation differences between the projected point
-// and the pixel actually rasterised - not wide enough to span a model, which is
-// what made the old bounding-radius slab accept unrelated geometry. Chests get
-// the tighter value because their probes sit on known surfaces; items allow a
-// little more because the default profile is generic. Both want calibrating
-// against the overlay.
-static constexpr int32_t kSeenChestDepthTolerance = 24;
+// Items have no front boundary to measure a band against, so they keep a flat
+// depth tolerance - generous, because the default profile is generic. It carries
+// the same distance problem the chest slop below solves, and is left alone only
+// because world items are not part of this pass.
 static constexpr int32_t kSeenItemDepthTolerance = 40;
+
+// What the chest tolerance actually covers is the disagreement between a point
+// projected on the CPU and the pixel the GPU rasterised, which is a fixed
+// displacement in *screen* space. Depth units are not, so the equivalent has to
+// be measured at each probe's own distance: a constant is sub-unit slop up close
+// and a window hundreds of world units deep at range. Calibrated against Mido,
+// where the old constant 24 worked out at 1.3 px near and 3.3 px far.
+static constexpr float kSeenProbeSlopPixels = 3.0f;
+// The sampler quantises, so never ask for a band finer than it can resolve.
+static constexpr int32_t kSeenProbeMinTolerance = 2;
 
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
 static std::unordered_map<RandomizerCheck, int> seenItemFrames;
@@ -656,6 +662,8 @@ struct SeenProbePoint {
     // Depth of the candidate's own front surface on the line to the eye. Chests
     // accept the band between the two; items still use expectedZ alone.
     int32_t nearZ;
+    // Slop either side of the band, measured at this probe's own distance.
+    int32_t tolerance;
 };
 
 // Evidence captured while a frame was being built, held until that frame's
@@ -752,6 +760,17 @@ static float SeenDepthWindowWorld(float distance, int32_t tolerance) {
         return 0.0f;
     }
     return tolerance * distance * distance / (16352.0f * 2.0f * gPlayState->view.zNear);
+}
+
+// What kSeenProbeSlopPixels is worth in world units at a given axial depth -
+// the accepted window either side of the band, now growing linearly with
+// distance rather than with its square.
+static float SeenProbeSlopWorld(float axial) {
+    if (gPlayState == nullptr) {
+        return 0.0f;
+    }
+    float tangent = tanf(gPlayState->view.fovy * 0.5f * 0.017453293f);
+    return tangent > 0.0001f ? kSeenProbeSlopPixels * axial * tangent / 120.0f : 0.0f;
 }
 
 // Inverse of the depth encoding in SeenProjectPoint: the axial depth a stored
@@ -920,6 +939,8 @@ static bool SeenBuildProbesFromMatrix(const Vec3f* modelPoints, int count, int32
             const Vec3f& eye = gPlayState->view.eye;
             record.distance = SeenVecLength({ world.x - eye.x, world.y - eye.y, world.z - eye.z });
         }
+        // Items have no boundary to measure against, so they keep the flat value.
+        point.tolerance = tolerance;
         minX = std::min(minX, point.x);
         maxX = std::max(maxX, point.x);
         minY = std::min(minY, point.y);
@@ -1106,6 +1127,15 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
         offsets[count++] = { dir.x * reach, dir.y * reach, dir.z * reach };
     }
 
+    // Screen units per world unit at unit depth, so a pixel of slop can be turned
+    // into a world offset at whatever distance each probe sits.
+    float halfFov = view.fovy * 0.5f * 0.017453293f;
+    float tangent = tanf(halfFov);
+    if (!(tangent > 0.0001f) || !std::isfinite(tangent)) {
+        return give_up("camera fov degenerate");
+    }
+    float screenScale = 120.0f / tangent;
+
     record.pointCount = 0;
     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
     for (int i = 0; i < count; i++) {
@@ -1132,6 +1162,15 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
             continue;
         }
         point.nearZ = boundary.expectedZ;
+        // Slide the boundary a few pixels' worth toward the eye and project again:
+        // the depth that move costs is what the slop is worth here.
+        float slop = kSeenProbeSlopPixels * distance / screenScale;
+        Vec3f slid = { front.x + toEye.x * slop, front.y + toEye.y * slop, front.z + toEye.z * slop };
+        SeenProbePoint slidPoint;
+        if (!SeenProjectPoint(slid, slidPoint)) {
+            continue;
+        }
+        point.tolerance = std::max(boundary.expectedZ - slidPoint.expectedZ, kSeenProbeMinTolerance);
         minX = std::min(minX, point.x);
         maxX = std::max(maxX, point.x);
         minY = std::min(minY, point.y);
@@ -1225,7 +1264,6 @@ extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) 
         return;
     }
     record.isChest = true;
-    record.slabHalfWidth = kSeenChestDepthTolerance;
     // What the chest is texturing from, captured as displayed.
     record.category = Randomizer_AdjustItemCategory(box->getItemEntry);
     if (!SeenBuildChestProbes(box, record, diagIndex >= 0 ? &seenChestGeometryDebug[diagIndex] : nullptr)) {
@@ -1385,7 +1423,8 @@ void CheckTrackerDepthProbeConsume() {
                     entry.rc = seenProbesInFlight[i].rc;
                     entry.isChest = seenProbesInFlight[i].isChest;
                     entry.wasSampled = false;
-                    entry.tolerance = seenProbesInFlight[i].slabHalfWidth;
+                    entry.tolerance = seenProbesInFlight[i].pointCount > 0 ? seenProbesInFlight[i].points[0].tolerance
+                                                                           : seenProbesInFlight[i].slabHalfWidth;
                     entry.pointCount = seenProbesInFlight[i].pointCount;
                     entry.distance = seenProbesInFlight[i].distance;
                     seenProbeDebug.push_back(entry);
@@ -1404,14 +1443,15 @@ void CheckTrackerDepthProbeConsume() {
                 int32_t sampled = OTRGetPixelDepth(record.points[i].sampleX, record.points[i].y) * 4 >> 3;
                 // A chest accepts the band from its own front surface back to the
                 // interior probe: nearer than that is an occluder, further means the
-                // probe saw past the model. slabHalfWidth covers projection and
+                // probe saw past the model. The tolerance covers projection and
                 // rasterisation only, never geometry error.
                 bool matched;
+                int32_t tolerance = record.points[i].tolerance;
                 if (record.isChest) {
-                    matched = sampled >= record.points[i].nearZ - record.slabHalfWidth &&
-                              sampled <= record.points[i].expectedZ + record.slabHalfWidth;
+                    matched = sampled >= record.points[i].nearZ - tolerance &&
+                              sampled <= record.points[i].expectedZ + tolerance;
                 } else {
-                    matched = std::abs(sampled - record.points[i].expectedZ) <= record.slabHalfWidth;
+                    matched = std::abs(sampled - record.points[i].expectedZ) <= tolerance;
                 }
                 if (matched) {
                     matches++;
@@ -1430,7 +1470,7 @@ void CheckTrackerDepthProbeConsume() {
                 entry.isChest = record.isChest;
                 entry.wasSampled = true;
                 entry.matches = matches;
-                entry.tolerance = record.slabHalfWidth;
+                entry.tolerance = record.pointCount > 0 ? record.points[0].tolerance : record.slabHalfWidth;
                 entry.pointCount = record.pointCount;
                 entry.distance = record.distance;
                 auto banked = seenItemFrames.find(record.rc);
@@ -3394,8 +3434,8 @@ static void DrawSeenProbeOverlay() {
                 seenProbeCandidatesLastFrame, seenProbeCoordinatesLastFrame, SeenProbeBudget());
     ImGui::Text("rejected (no useful projection) %d | deferred (no budget) %d | matched %d", seenProbeRejectedLastFrame,
                 seenProbeDeferredLastFrame, seenProbeMatchesLastFrame);
-    ImGui::Text("frames required %d | chest tolerance %d | item tolerance %d", kSeenFramesRequired,
-                kSeenChestDepthTolerance, kSeenItemDepthTolerance);
+    ImGui::Text("frames required %d | chest slop %.1f px (min %d) | item tolerance %d", kSeenFramesRequired,
+                kSeenProbeSlopPixels, kSeenProbeMinTolerance, kSeenItemDepthTolerance);
     ImGui::Separator();
     for (const auto& geom : seenChestGeometryDebug) {
         const char* name = Rando::StaticData::GetLocation(geom.rc)->GetShortName().c_str();
@@ -3417,8 +3457,8 @@ static void DrawSeenProbeOverlay() {
                     geom.root.pos.z - geom.dyna.pos.z);
         ImGui::Text("root rot (%6d,%6d,%6d) dyna rot (%6d,%6d,%6d)", geom.root.rot.x, geom.root.rot.y, geom.root.rot.z,
                     geom.dyna.rot.x, geom.dyna.rot.y, geom.dyna.rot.z);
-        ImGui::Text("dist %.0f euclid, %.0f axial, window +/-%.0f world units", geom.distance, geom.axial,
-                    SeenDepthWindowWorld(geom.axial, kSeenChestDepthTolerance));
+        ImGui::Text("dist %.0f euclid, %.0f axial, slop +/-%.1f world units", geom.distance, geom.axial,
+                    SeenProbeSlopWorld(geom.axial));
         if (geom.probeReason != nullptr) {
             ImGui::Text("REJECTED: %s - %d/%d probes on screen, span %.1f x %.1f (need %.1f)", geom.probeReason,
                         geom.projected, kSeenProbesPerCandidate, geom.spanX, geom.spanY, kSeenMinScreenRadius);
