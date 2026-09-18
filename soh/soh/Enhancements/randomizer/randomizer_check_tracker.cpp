@@ -656,6 +656,13 @@ static constexpr int32_t kSeenProbeMinTolerance = 2;
 // every probe seeing past the model.
 static constexpr int32_t kSeenDepthScale = 16384;
 
+// How far a chest may be and still disclose. Not a limit of the depth buffer,
+// which reads correctly well past this - it is where a mark stops being
+// something the player could reasonably have read off the chest themselves. At
+// this range the accepted window is around 13 world units, and a grotto chest
+// seen from the entrance sits at roughly 650.
+static constexpr float kSeenMaxProbeDistance = 900.0f;
+
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
 static std::unordered_map<RandomizerCheck, int> seenItemFrames;
 
@@ -1118,6 +1125,11 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
         // differ by the off-axis angle and nothing else.
         diag->axial = (obb.centre.x - eye.x) * forward.x + (obb.centre.y - eye.y) * forward.y +
                       (obb.centre.z - eye.z) * forward.z;
+    }
+    // Checked before any probe is projected, but after the diagnostics above so a
+    // chest rejected on range still reports how far away it was.
+    if (record.distance > kSeenMaxProbeDistance) {
+        return give_up("too far");
     }
 
     // Centre, plus four points half way out to where the cross-section meets the
@@ -3444,8 +3456,9 @@ static void DrawSeenProbeOverlay() {
                 seenProbeCandidatesLastFrame, seenProbeCoordinatesLastFrame, SeenProbeBudget());
     ImGui::Text("rejected (no useful projection) %d | deferred (no budget) %d | matched %d", seenProbeRejectedLastFrame,
                 seenProbeDeferredLastFrame, seenProbeMatchesLastFrame);
-    ImGui::Text("frames required %d | chest slop %.1f px (min %d) | item tolerance %d", kSeenFramesRequired,
-                kSeenProbeSlopPixels, kSeenProbeMinTolerance, kSeenItemDepthTolerance);
+    ImGui::Text("frames required %d | chest slop %.1f px (min %d) | max distance %.0f | item tolerance %d",
+                kSeenFramesRequired, kSeenProbeSlopPixels, kSeenProbeMinTolerance, kSeenMaxProbeDistance,
+                kSeenItemDepthTolerance);
     ImGui::Separator();
     for (const auto& geom : seenChestGeometryDebug) {
         const char* name = Rando::StaticData::GetLocation(geom.rc)->GetShortName().c_str();
