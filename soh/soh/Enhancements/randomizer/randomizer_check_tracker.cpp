@@ -647,6 +647,15 @@ static constexpr float kSeenProbeSlopPixels = 3.0f;
 // The sampler quantises, so never ask for a band finer than it can resolve.
 static constexpr int32_t kSeenProbeMinTolerance = 2;
 
+// Half the range a projected depth is encoded into. Lights_GlowCheck uses the
+// N64-native 16352, but the depth returned here has been through the host's
+// buffer: gfx_opengl.cpp reads GL_UNSIGNED_INT_24_8 and returns
+// (value >> 18) << 2, which SoH then halves, landing on a full-scale 16384.
+// Encoding against 16352 and comparing against that is a 0.2% mismatch - only
+// ~60 depth units, but the band closes to single digits at range, so it read as
+// every probe seeing past the model.
+static constexpr int32_t kSeenDepthScale = 16384;
+
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
 static std::unordered_map<RandomizerCheck, int> seenItemFrames;
 
@@ -759,7 +768,7 @@ static float SeenDepthWindowWorld(float distance, int32_t tolerance) {
     if (gPlayState == nullptr || !(distance > 0.0f)) {
         return 0.0f;
     }
-    return tolerance * distance * distance / (16352.0f * 2.0f * gPlayState->view.zNear);
+    return tolerance * distance * distance / (kSeenDepthScale * 2.0f * gPlayState->view.zNear);
 }
 
 // What kSeenProbeSlopPixels is worth in world units at a given axial depth -
@@ -783,7 +792,7 @@ static float SeenDepthToAxial(int32_t depth) {
     }
     float zn = gPlayState->view.zNear;
     float zf = gPlayState->view.zFar;
-    float ndc = (depth - 16352.0f) / 16352.0f;
+    float ndc = (depth - kSeenDepthScale) / static_cast<float>(kSeenDepthScale);
     float denom = (zn + zf) / (zf - zn) - ndc;
     return denom > 1e-6f ? (2.0f * zn * zf / (zf - zn)) / denom : 0.0f;
 }
@@ -866,7 +875,8 @@ static bool SeenItemIdentity(Actor* actor, RandomizerCheck& rc, GetItemEntry& dr
 }
 
 // Screen position and depth of a world point, in the N64 320x240 space that
-// OTRGetPixelDepth expects. Mirrors Lights_GlowCheck's projection.
+// OTRGetPixelDepth expects. Follows Lights_GlowCheck's projection, but encodes
+// depth against the sampler's scale rather than the N64's - see kSeenDepthScale.
 static bool SeenProjectPoint(const Vec3f& world, SeenProbePoint& out) {
     Vec3f projected;
     float w;
@@ -876,7 +886,7 @@ static bool SeenProjectPoint(const Vec3f& world, SeenProbePoint& out) {
     }
     out.x = projected.x * w * 160.0f + 160.0f;
     out.y = projected.y * w * 120.0f + 120.0f;
-    out.expectedZ = static_cast<int32_t>((projected.z * w) * 16352.0f) + 16352;
+    out.expectedZ = static_cast<int32_t>((projected.z * w) * kSeenDepthScale) + kSeenDepthScale;
     out.nearZ = out.expectedZ; // callers with a real boundary overwrite this
     // The depth sampler stretches the native SCREEN_WIDTH field across the whole
     // framebuffer, while a widescreen projection puts the visible edges outside
