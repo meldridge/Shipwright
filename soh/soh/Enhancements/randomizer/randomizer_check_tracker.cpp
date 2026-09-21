@@ -619,48 +619,23 @@ static constexpr int kSeenMaxProbeCoordinates = 48;
 // recognise, whatever the depth buffer says.
 static constexpr float kSeenMinScreenRadius = 3.0f;
 
-// The live budget. Debug-only override, so scheduling behaviour above the budget
-// can be reproduced without needing ten candidates on screen at once.
-static int SeenProbeBudget() {
-    if (CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) != 0) {
-        int budget = CVarGetInteger(CVAR_TRACKER_CHECK("ProbeBudget"), kSeenMaxProbeCoordinates);
-        if (budget >= kSeenProbesPerCandidate && budget <= kSeenMaxProbeCoordinates) {
-            return budget;
-        }
-    }
-    return kSeenMaxProbeCoordinates;
-}
-
-// Items have no front boundary to measure a band against, so they keep a flat
-// depth tolerance - generous, because the default profile is generic. It carries
-// the same distance problem the chest slop below solves, and is left alone only
-// because world items are not part of this pass.
+// Items have no front boundary to form a band from, so they keep a flat value.
 static constexpr int32_t kSeenItemDepthTolerance = 40;
 
-// What the chest tolerance actually covers is the disagreement between a point
-// projected on the CPU and the pixel the GPU rasterised, which is a fixed
-// displacement in *screen* space. Depth units are not, so the equivalent has to
-// be measured at each probe's own distance: a constant is sub-unit slop up close
-// and a window hundreds of world units deep at range. Calibrated against Mido,
-// where the old constant 24 worked out at 1.3 px near and 3.3 px far.
+// Chest slop is a fixed screen displacement - CPU projection against the pixel
+// the GPU rasterised - so its depth equivalent is measured per probe. A constant
+// in depth units is sub-unit slop up close and hundreds of world units at range.
 static constexpr float kSeenProbeSlopPixels = 3.0f;
 // The sampler quantises, so never ask for a band finer than it can resolve.
 static constexpr int32_t kSeenProbeMinTolerance = 2;
 
-// Half the range a projected depth is encoded into. Lights_GlowCheck uses the
-// N64-native 16352, but the depth returned here has been through the host's
-// buffer: gfx_opengl.cpp reads GL_UNSIGNED_INT_24_8 and returns
-// (value >> 18) << 2, which SoH then halves, landing on a full-scale 16384.
-// Encoding against 16352 and comparing against that is a 0.2% mismatch - only
-// ~60 depth units, but the band closes to single digits at range, so it read as
-// every probe seeing past the model.
+// Half the range a projected depth is encoded into. Not Lights_GlowCheck's
+// N64-native 16352: the sampler returns the host buffer's full-scale 16384, and
+// the 0.2% between them is ~60 depth units, wider than the band at range.
 static constexpr int32_t kSeenDepthScale = 16384;
 
-// How far a chest may be and still disclose. Not a limit of the depth buffer,
-// which reads correctly well past this - it is where a mark stops being
-// something the player could reasonably have read off the chest themselves. At
-// this range the accepted window is around 13 world units, and a grotto chest
-// seen from the entrance sits at roughly 650.
+// How far a chest may be and still disclose. A spoiler boundary, not a limit of
+// the depth buffer, which reads correctly well past this.
 static constexpr float kSeenMaxProbeDistance = 900.0f;
 
 // Keyed by check, not actor, so respawns/room reloads can't dangle it.
@@ -690,9 +665,8 @@ struct SeenProbeRecord {
     bool isChest;
     GetItemCategory category;
     GetItemEntry drawnEntry;
-    int32_t slabHalfWidth;
     int16_t sceneNum;
-    float distance; // camera to candidate centre, diagnostics only
+    float distance; // camera to candidate centre, against kSeenMaxProbeDistance
     int pointCount;
     SeenProbePoint points[kSeenProbesPerCandidate];
 };
@@ -709,100 +683,9 @@ static uint32_t seenProbesLastEvaluated = UINT32_MAX;
 static bool seenProbesPendingValid = false;
 static bool seenProbesInFlightValid = false;
 
-// Diagnostics, surfaced in the tracker's settings window.
-static int seenProbeCoordinatesLastFrame = 0;
-static int seenProbeCandidatesLastFrame = 0;
-static int seenProbeDeferredLastFrame = 0; // eligible, but no budget left this frame
-static int seenProbeRejectedLastFrame = 0; // eligible, but would not project usefully
-static int seenProbeMatchesLastFrame = 0;
 // Fairness is keyed by check, not by position: the eligible list is rebuilt from
 // the actor lists every frame and its order is not stable.
 static RandomizerCheck seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
-
-// Snapshot of the last evaluated batch, kept only while the overlay is open.
-// The probe geometry and tolerances are guesses until they are calibrated
-// against this, so it shows every number the decision was made from.
-struct SeenProbeDebugPoint {
-    float x;
-    float y;
-    int32_t expectedZ;
-    int32_t nearZ;
-    int32_t sampledZ;
-    bool matched;
-};
-struct SeenProbeDebugRecord {
-    RandomizerCheck rc;
-    bool isChest;
-    bool wasSampled; // false means deferred for want of budget
-    int matches;
-    int32_t tolerance;
-    int pointCount;
-    int framesBanked;
-    float distance;
-    SeenProbeDebugPoint points[kSeenProbesPerCandidate];
-};
-static std::vector<SeenProbeDebugRecord> seenProbeDebug;
-static uint32_t seenProbeDebugFrame = 0;
-
-// Instrumentation for the probe-geometry rework: what the collision header
-// reports, and the two candidate placement transforms. Read-only - the
-// predicate still runs on the old constants.
-struct SeenChestGeometryDebug {
-    RandomizerCheck rc;
-    int32_t bgId;
-    const char* colReason;   // null once the collision lookup is usable
-    const char* probeReason; // why probe building gave up, null if it did not
-    int projected;           // probes that landed on screen
-    float spanX;             // achieved screen span, N64 units
-    float spanY;
-    float distance; // camera to AABB centre, euclidean
-    float axial;    // the same, projected onto the view axis: what depth is a function of
-    Vec3s minBounds;
-    Vec3s maxBounds;
-    Vec3f centre;     // model units
-    Vec3f halfExtent; // model units
-    ScaleRotPos dyna; // BgActor.curTransform
-    ScaleRotPos root; // placement as Actor_Draw builds it
-};
-static std::vector<SeenChestGeometryDebug> seenChestGeometryDebug;
-
-// What a depth tolerance actually admits, in world units. Depth is non-linear,
-// so a constant number of depth units is a window that grows with the square of
-// the viewing distance: sub-unit slop up close, hundreds of units far away.
-// Derived rather than stored, so it cannot disagree with the tolerance it came
-// from.
-static float SeenDepthWindowWorld(float distance, int32_t tolerance) {
-    if (gPlayState == nullptr || !(distance > 0.0f)) {
-        return 0.0f;
-    }
-    return tolerance * distance * distance / (kSeenDepthScale * 2.0f * gPlayState->view.zNear);
-}
-
-// What kSeenProbeSlopPixels is worth in world units at a given axial depth -
-// the accepted window either side of the band, now growing linearly with
-// distance rather than with its square.
-static float SeenProbeSlopWorld(float axial) {
-    if (gPlayState == nullptr) {
-        return 0.0f;
-    }
-    float tangent = tanf(gPlayState->view.fovy * 0.5f * 0.017453293f);
-    return tangent > 0.0001f ? kSeenProbeSlopPixels * axial * tangent / 120.0f : 0.0f;
-}
-
-// Inverse of the depth encoding in SeenProjectPoint: the axial depth a stored
-// value corresponds to. Only the projection's own near/far are involved, so a
-// disagreement with the measured geometry means the two are not describing the
-// same point.
-static float SeenDepthToAxial(int32_t depth) {
-    if (gPlayState == nullptr) {
-        return 0.0f;
-    }
-    float zn = gPlayState->view.zNear;
-    float zf = gPlayState->view.zFar;
-    float ndc = (depth - kSeenDepthScale) / static_cast<float>(kSeenDepthScale);
-    float denom = (zn + zf) / (zf - zn) - ndc;
-    return denom > 1e-6f ? (2.0f * zn * zf / (zf - zn)) / denom : 0.0f;
-}
 
 // The check types a world sighting may mark, as an allowlist: most shuffle
 // features route their items through EnItem00, so a new one has to opt in here
@@ -943,7 +826,6 @@ static bool SeenChestCategory(Actor* actor, RandomizerCheck& rc) {
 
 static bool SeenBuildProbesFromMatrix(const Vec3f* modelPoints, int count, int32_t tolerance, SeenProbeRecord& record) {
     record.pointCount = 0;
-    record.slabHalfWidth = tolerance;
     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
     for (int i = 0; i < count && record.pointCount < kSeenProbesPerCandidate; i++) {
         Vec3f world;
@@ -977,12 +859,7 @@ static bool SeenRegisterCommon(RandomizerCheck rc, SeenProbeRecord& record) {
     if (!seenProbesPendingValid || rc == RC_UNKNOWN_CHECK) {
         return false;
     }
-    if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED &&
-        // Debug only: keep sampling checks that have already been marked, so the
-        // geometry can be re-tested from other angles without a fresh seed. The
-        // consume phase still refuses to re-mark them.
-        !(CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) != 0 &&
-          CVarGetInteger(CVAR_TRACKER_CHECK("ProbeRetestMarked"), 0) != 0)) {
+    if (OTRGlobals::Instance->gRandoContext->GetItemLocation(rc)->GetCheckStatus() != RCSHOW_UNCHECKED) {
         return false;
     }
     for (const auto& queued : seenProbesPending) {
@@ -1079,58 +956,36 @@ static bool SeenObbExitDistance(const SeenChestObb& obb, const Vec3f& from, cons
 }
 
 // Probes on a view-aligned cross-section through the box centre, so the pattern
-// keeps its screen spread from any angle instead of collapsing when a local axis
-// happens to point at the camera. Each probe carries the depth of the chest's own
-// front surface along its line to the eye, which is what makes the accepted band
-// track the non-linear depth curve at that probe's distance.
-static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestGeometryDebug* diag) {
-    // "Rejected" bundles several unrelated causes, and telling them apart is the
-    // difference between "too far away" and "the geometry is wrong".
-    auto give_up = [diag](const char* why) {
-        if (diag != nullptr) {
-            diag->probeReason = why;
-        }
-        return false;
-    };
+// keeps its screen spread from any angle rather than collapsing when a local axis
+// points at the camera. Each carries the depth of the chest's own front surface
+// along its line to the eye, which is what makes the band track the depth curve.
+static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record) {
     SeenChestObb obb;
     if (!SeenBuildChestObb(box, obb)) {
-        return give_up("collision unusable");
+        return false;
     }
     // Same view the projection uses, so cutscene and quake camera offsets agree.
     const View& view = gPlayState->view;
     Vec3f eye = view.eye;
-    // Recorded before the basis checks so a rejected candidate still reports how
-    // far away it was.
     record.distance = SeenVecLength({ obb.centre.x - eye.x, obb.centre.y - eye.y, obb.centre.z - eye.z });
-    if (diag != nullptr) {
-        diag->distance = record.distance;
+    if (record.distance > kSeenMaxProbeDistance) {
+        return false;
     }
     Vec3f forward = { view.lookAt.x - eye.x, view.lookAt.y - eye.y, view.lookAt.z - eye.z };
     float length = SeenVecLength(forward);
     if (!(length > 0.001f)) {
-        return give_up("camera basis degenerate");
+        return false;
     }
     forward = { forward.x / length, forward.y / length, forward.z / length };
     Vec3f right = { forward.y * view.up.z - forward.z * view.up.y, forward.z * view.up.x - forward.x * view.up.z,
                     forward.x * view.up.y - forward.y * view.up.x };
     length = SeenVecLength(right);
     if (!(length > 0.001f)) {
-        return give_up("camera basis degenerate");
+        return false;
     }
     right = { right.x / length, right.y / length, right.z / length };
     Vec3f up = { right.y * forward.z - right.z * forward.y, right.z * forward.x - right.x * forward.z,
                  right.x * forward.y - right.y * forward.x };
-    if (diag != nullptr) {
-        // expectedZ is a function of this, not of the euclidean distance; the two
-        // differ by the off-axis angle and nothing else.
-        diag->axial = (obb.centre.x - eye.x) * forward.x + (obb.centre.y - eye.y) * forward.y +
-                      (obb.centre.z - eye.z) * forward.z;
-    }
-    // Checked before any probe is projected, but after the diagnostics above so a
-    // chest rejected on range still reports how far away it was.
-    if (record.distance > kSeenMaxProbeDistance) {
-        return give_up("too far");
-    }
 
     // Centre, plus four points half way out to where the cross-section meets the
     // box. Half keeps them inside the silhouette at oblique angles, since the box
@@ -1143,18 +998,16 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
     for (const Vec3f& dir : spread) {
         float reach;
         if (count >= kSeenProbesPerCandidate || !SeenObbExitDistance(obb, obb.centre, dir, reach)) {
-            return give_up("cross-section missed the box");
+            return false;
         }
         reach *= kSpreadFraction;
         offsets[count++] = { dir.x * reach, dir.y * reach, dir.z * reach };
     }
 
-    // Screen units per world unit at unit depth, so a pixel of slop can be turned
-    // into a world offset at whatever distance each probe sits.
-    float halfFov = view.fovy * 0.5f * 0.017453293f;
-    float tangent = tanf(halfFov);
+    // Screen units per world unit at unit depth, to size the slop below.
+    float tangent = tanf(view.fovy * 0.5f * 0.017453293f);
     if (!(tangent > 0.0001f) || !std::isfinite(tangent)) {
-        return give_up("camera fov degenerate");
+        return false;
     }
     float screenScale = 120.0f / tangent;
 
@@ -1184,8 +1037,8 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
             continue;
         }
         point.nearZ = boundary.expectedZ;
-        // Slide the boundary a few pixels' worth toward the eye and project again:
-        // the depth that move costs is what the slop is worth here.
+        // Slide the boundary a few pixels toward the eye: the depth that costs is
+        // what the slop is worth at this distance.
         float slop = kSeenProbeSlopPixels * distance / screenScale;
         Vec3f slid = { front.x + toEye.x * slop, front.y + toEye.y * slop, front.z + toEye.z * slop };
         SeenProbePoint slidPoint;
@@ -1199,20 +1052,12 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
         maxY = std::max(maxY, point.y);
         record.points[record.pointCount++] = point;
     }
-    float spanX = record.pointCount > 0 ? maxX - minX : 0.0f;
-    float spanY = record.pointCount > 0 ? maxY - minY : 0.0f;
-    if (diag != nullptr) {
-        diag->projected = record.pointCount;
-        diag->spanX = spanX;
-        diag->spanY = spanY;
-    }
     if (record.pointCount < kSeenProbeMatchesRequired) {
-        return give_up("too few probes on screen");
+        return false;
     }
-    if (spanX < kSeenMinScreenRadius && spanY < kSeenMinScreenRadius) {
-        return give_up("screen span below minimum");
-    }
-    return true;
+    float spanX = maxX - minX;
+    float spanY = maxY - minY;
+    return spanX >= kSeenMinScreenRadius || spanY >= kSeenMinScreenRadius;
 }
 
 // Default world-item profile, in the item's own model space so the draw's scale
@@ -1221,46 +1066,6 @@ static bool SeenBuildChestProbes(EnBox* box, SeenProbeRecord& record, SeenChestG
 static const Vec3f kItemProbes[] = {
     { 0.0f, 0.0f, 0.0f }, { -6.0f, 4.0f, 0.0f }, { 6.0f, 4.0f, 0.0f }, { -6.0f, -4.0f, 0.0f }, { 6.0f, -4.0f, 0.0f },
 };
-
-// Collision supplies model-space bounds; placement comes from the actor root,
-// which updates after DynaPoly_Setup has already run for the tick (z_actor.c:2703
-// fires on ACTORCAT_BG, while En_Box is ACTORCAT_CHEST). Both are captured so any
-// lag on a moving chest is measurable rather than assumed.
-static void SeenCaptureChestGeometry(EnBox* box, RandomizerCheck rc) {
-    Actor* actor = &box->dyna.actor;
-    SeenChestGeometryDebug entry{};
-    entry.rc = rc;
-    entry.bgId = box->dyna.bgId;
-    entry.root.pos = actor->world.pos;
-    entry.root.pos.y += actor->shape.yOffset * actor->scale.y;
-    entry.root.rot = actor->shape.rot;
-    entry.root.scale = actor->scale;
-
-    DynaCollisionContext& dyna = gPlayState->colCtx.dyna;
-    int32_t bgId = entry.bgId;
-    if (bgId < 0 || bgId >= BG_ACTOR_MAX) {
-        entry.colReason = "bgId out of range";
-    } else if ((dyna.bgActorFlags[bgId] & 1) == 0) {
-        entry.colReason = "slot not allocated";
-    } else if ((dyna.bgActorFlags[bgId] & 2) != 0) {
-        entry.colReason = "slot pending deletion";
-    } else if (dyna.bgActors[bgId].actor != actor) {
-        entry.colReason = "slot owned by another actor";
-    } else if (dyna.bgActors[bgId].colHeader == nullptr) {
-        entry.colReason = "no collision header";
-    } else {
-        const BgActor& bgActor = dyna.bgActors[bgId];
-        entry.minBounds = bgActor.colHeader->minBounds;
-        entry.maxBounds = bgActor.colHeader->maxBounds;
-        entry.centre = { (entry.minBounds.x + entry.maxBounds.x) * 0.5f, (entry.minBounds.y + entry.maxBounds.y) * 0.5f,
-                         (entry.minBounds.z + entry.maxBounds.z) * 0.5f };
-        entry.halfExtent = { (entry.maxBounds.x - entry.minBounds.x) * 0.5f,
-                             (entry.maxBounds.y - entry.minBounds.y) * 0.5f,
-                             (entry.maxBounds.z - entry.minBounds.z) * 0.5f };
-        entry.dyna = bgActor.curTransform;
-    }
-    seenChestGeometryDebug.push_back(entry);
-}
 
 extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) {
     if (gPlayState == nullptr || !GameInteractor::IsSaveLoaded() || !IS_RANDO || box == nullptr) {
@@ -1275,12 +1080,6 @@ extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) 
     if (!SeenChestCategory(&box->dyna.actor, rc)) {
         return;
     }
-    // Ahead of the eligibility checks, so a chest that dedups out is still measurable.
-    int diagIndex = -1;
-    if (CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0)) {
-        SeenCaptureChestGeometry(box, rc);
-        diagIndex = static_cast<int>(seenChestGeometryDebug.size()) - 1;
-    }
     SeenProbeRecord record{};
     if (!SeenRegisterCommon(rc, record)) {
         return;
@@ -1288,8 +1087,7 @@ extern "C" void CheckTracker_RegisterChestProbes(EnBox* box, int32_t limbIndex) 
     record.isChest = true;
     // What the chest is texturing from, captured as displayed.
     record.category = Randomizer_AdjustItemCategory(box->getItemEntry);
-    if (!SeenBuildChestProbes(box, record, diagIndex >= 0 ? &seenChestGeometryDebug[diagIndex] : nullptr)) {
-        seenProbeRejectedLastFrame++;
+    if (!SeenBuildChestProbes(box, record)) {
         return;
     }
     seenProbesPending.push_back(record);
@@ -1315,7 +1113,6 @@ extern "C" void CheckTracker_RegisterItemProbes(Actor* actor, GetItemEntry entry
     record.isChest = false;
     record.drawnEntry = entry; // the entry actually handed to GetItemEntry_Draw
     if (!SeenBuildProbesFromMatrix(kItemProbes, ARRAY_COUNT(kItemProbes), kSeenItemDepthTolerance, record)) {
-        seenProbeRejectedLastFrame++;
         return;
     }
     seenProbesPending.push_back(record);
@@ -1328,10 +1125,8 @@ void CheckTrackerSeenItemsFrame() {
         return;
     }
     seenProbesPending.clear();
-    seenChestGeometryDebug.clear();
     seenProbesPendingFrame = gPlayState->gameplayFrames;
     seenProbesPendingValid = true;
-    seenProbeRejectedLastFrame = 0;
     // Nothing is redrawn behind the pause menu, so leave the batch empty: that
     // ends any run of consecutive frames rather than freezing it.
     if (gPlayState->pauseCtx.state != 0) {
@@ -1355,9 +1150,6 @@ static std::vector<size_t> seenProbesSampled;
 // more candidates are eligible than the budget covers.
 static std::unordered_set<RandomizerCheck> seenProbesDeferred;
 static bool seenProbesAwaitingConsume = false;
-// Highest banked count reached per check, so a counter that churns faster than the
-// eye can follow is still legible in the overlay. Diagnostics only.
-static std::unordered_map<RandomizerCheck, int> seenProbePeakBanked;
 
 // Prepare phase: queue coordinates only, never read. The depth buffer here holds
 // the frame built during the previous gameplay update, which is why the records
@@ -1378,7 +1170,6 @@ void CheckTrackerDepthProbePrepare() {
         // Budget and fairness are applied here, where the whole frame's records
         // are known. Resuming after the check that led last time stops the draw
         // order deciding who never gets sampled.
-        seenProbeCandidatesLastFrame = static_cast<int>(seenProbesInFlight.size());
         size_t startAt = 0;
         for (size_t i = 0; i < seenProbesInFlight.size(); i++) {
             if (seenProbesInFlight[i].rc == seenProbeScheduleAfter) {
@@ -1386,7 +1177,7 @@ void CheckTrackerDepthProbePrepare() {
                 break;
             }
         }
-        int coordinateBudget = SeenProbeBudget();
+        int coordinateBudget = kSeenMaxProbeCoordinates;
         for (size_t n = 0; n < seenProbesInFlight.size(); n++) {
             size_t index = (startAt + n) % seenProbesInFlight.size();
             if (seenProbesInFlight[index].pointCount > coordinateBudget) {
@@ -1395,7 +1186,6 @@ void CheckTrackerDepthProbePrepare() {
             coordinateBudget -= seenProbesInFlight[index].pointCount;
             seenProbesSampled.push_back(index);
         }
-        seenProbeDeferredLastFrame = static_cast<int>(seenProbesInFlight.size() - seenProbesSampled.size());
         {
             std::unordered_set<size_t> sampledSet(seenProbesSampled.begin(), seenProbesSampled.end());
             for (size_t i = 0; i < seenProbesInFlight.size(); i++) {
@@ -1408,12 +1198,10 @@ void CheckTrackerDepthProbePrepare() {
             seenProbeScheduleAfter = seenProbesInFlight[startAt].rc;
         }
 
-        seenProbeCoordinatesLastFrame = 0;
         for (size_t index : seenProbesSampled) {
             const auto& record = seenProbesInFlight[index];
             for (int i = 0; i < record.pointCount; i++) {
                 OTRGetPixelDepthPrepare(record.points[i].sampleX, record.points[i].y);
-                seenProbeCoordinatesLastFrame++;
             }
         }
     }
@@ -1431,35 +1219,12 @@ void CheckTrackerDepthProbeConsume() {
         const std::vector<size_t>& sampled = seenProbesSampled;
 
         bool anySeen = false;
-        seenProbeMatchesLastFrame = 0;
-        const bool debugging = CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) != 0;
-        if (debugging) {
-            seenProbeDebug.clear();
-            seenProbeDebugFrame = seenProbesInFlightFrame;
-            // Deferred records are recorded too: "why did nothing happen" is
-            // usually answered by budget, not by the depth comparison.
-            std::unordered_set<size_t> sampledSet(sampled.begin(), sampled.end());
-            for (size_t i = 0; i < seenProbesInFlight.size(); i++) {
-                if (sampledSet.count(i) == 0) {
-                    SeenProbeDebugRecord entry{};
-                    entry.rc = seenProbesInFlight[i].rc;
-                    entry.isChest = seenProbesInFlight[i].isChest;
-                    entry.wasSampled = false;
-                    entry.tolerance = seenProbesInFlight[i].pointCount > 0 ? seenProbesInFlight[i].points[0].tolerance
-                                                                           : seenProbesInFlight[i].slabHalfWidth;
-                    entry.pointCount = seenProbesInFlight[i].pointCount;
-                    entry.distance = seenProbesInFlight[i].distance;
-                    seenProbeDebug.push_back(entry);
-                }
-            }
-        }
         std::unordered_set<RandomizerCheck> matchedThisFrame;
         for (size_t index : sampled) {
             const auto& record = seenProbesInFlight[index];
             if (record.sceneNum != gPlayState->sceneNum) {
                 continue; // evidence belongs to a scene we have left
             }
-            SeenProbeDebugRecord entry{};
             int matches = 0;
             for (int i = 0; i < record.pointCount; i++) {
                 int32_t sampled = OTRGetPixelDepth(record.points[i].sampleX, record.points[i].y) * 4 >> 3;
@@ -1478,38 +1243,12 @@ void CheckTrackerDepthProbeConsume() {
                 if (matched) {
                     matches++;
                 }
-                if (debugging) {
-                    entry.points[i] = { record.points[i].x,
-                                        record.points[i].y,
-                                        record.points[i].expectedZ,
-                                        record.points[i].nearZ,
-                                        sampled,
-                                        matched };
-                }
-            }
-            if (debugging) {
-                entry.rc = record.rc;
-                entry.isChest = record.isChest;
-                entry.wasSampled = true;
-                entry.matches = matches;
-                entry.tolerance = record.pointCount > 0 ? record.points[0].tolerance : record.slabHalfWidth;
-                entry.pointCount = record.pointCount;
-                entry.distance = record.distance;
-                auto banked = seenItemFrames.find(record.rc);
-                entry.framesBanked = banked == seenItemFrames.end() ? 0 : banked->second;
-                seenProbeDebug.push_back(entry);
             }
             if (matches < kSeenProbeMatchesRequired) {
                 continue;
             }
             matchedThisFrame.insert(record.rc);
-            seenProbeMatchesLastFrame++;
-            int banked = ++seenItemFrames[record.rc];
-            if (debugging) {
-                int& peak = seenProbePeakBanked[record.rc];
-                peak = std::max(peak, banked);
-            }
-            if (banked < kSeenFramesRequired) {
+            if (++seenItemFrames[record.rc] < kSeenFramesRequired) {
                 continue;
             }
             seenItemFrames.erase(record.rc);
@@ -2027,11 +1766,6 @@ void Teardown() {
     seenProbesInFlightFrame = 0;
     seenProbesLastEvaluated = UINT32_MAX;
     seenProbeScheduleAfter = RC_UNKNOWN_CHECK;
-    seenProbeCoordinatesLastFrame = 0;
-    seenProbeCandidatesLastFrame = 0;
-    seenProbeDeferredLastFrame = 0;
-    seenProbeRejectedLastFrame = 0;
-    seenProbeMatchesLastFrame = 0;
 
     lastLocationChecked = RC_UNKNOWN_CHECK;
 }
@@ -3385,144 +3119,6 @@ void CheckTrackerWindow::Draw() {
     SyncVisibilityConsoleVariable();
 }
 
-// Marks where each probe landed, so "is the pattern actually on the model" is a
-// thing you can see rather than infer from depth numbers. Green passed, red did
-// not. Widescreen shows more than the native 320 field, so the horizontal span
-// has to come from the active edges rather than 0..SCREEN_WIDTH.
-static void SeenDrawProbeMarkers() {
-    // Driven from UpdateElement, which runs every frame whether or not the tracker
-    // window is open, so the markers stay visible while playing.
-    if (!CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0) || seenProbeDebug.empty()) {
-        return;
-    }
-    float left = OTRGetDimensionFromLeftEdge(0.0f);
-    float right = OTRGetDimensionFromRightEdge(SCREEN_WIDTH);
-    if (!(right > left)) {
-        return;
-    }
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImDrawList* draw = ImGui::GetForegroundDrawList();
-    for (const auto& entry : seenProbeDebug) {
-        if (!entry.wasSampled) {
-            continue;
-        }
-        for (int i = 0; i < entry.pointCount; i++) {
-            const auto& point = entry.points[i];
-            float u = (point.x - left) / (right - left);
-            // Actor_ProjectPos gives +y upward, so probe y counts up from the
-            // bottom while pixel rows count down from the top.
-            float v = (static_cast<float>(SCREEN_HEIGHT) - point.y) / static_cast<float>(SCREEN_HEIGHT);
-            // WorkPos/WorkSize, not Pos/Size: the game renders below the menubar,
-            // and using the full window puts every marker a menubar too high.
-            ImVec2 at = { viewport->WorkPos.x + u * viewport->WorkSize.x,
-                          viewport->WorkPos.y + v * viewport->WorkSize.y };
-            draw->AddCircleFilled(at, 4.0f, point.matched ? IM_COL32(0, 255, 0, 255) : IM_COL32(255, 48, 48, 255));
-            draw->AddCircle(at, 5.0f, IM_COL32(0, 0, 0, 200));
-        }
-    }
-}
-
-// Everything the sight-disclosure decision was made from, for calibrating the
-// probe geometry and tolerances against real scenes instead of screenshots.
-static void DrawSeenProbeOverlay() {
-    if (!ImGui::CollapsingHeader("Sight Disclosure Probes (debug)")) {
-        return;
-    }
-    UIWidgets::CVarCheckbox("Capture probe diagnostics", CVAR_TRACKER_CHECK("ProbeOverlay"),
-                            UIWidgets::CheckboxOptions()
-                                .Color(THEME_COLOR)
-                                .Tooltip("Records what each depth probe sampled. Costs nothing while closed."));
-    if (!CVarGetInteger(CVAR_TRACKER_CHECK("ProbeOverlay"), 0)) {
-        return;
-    }
-    UIWidgets::CVarCheckbox("Re-test already-marked checks", CVAR_TRACKER_CHECK("ProbeRetestMarked"),
-                            UIWidgets::CheckboxOptions()
-                                .Color(THEME_COLOR)
-                                .Tooltip("Keeps probing checks that have already been marked, so geometry can be "
-                                         "re-tested from other angles. Cannot re-mark anything."));
-    UIWidgets::CVarSliderInt("Coordinate budget", CVAR_TRACKER_CHECK("ProbeBudget"),
-                             UIWidgets::IntSliderOptions()
-                                 .Color(THEME_COLOR)
-                                 .Min(kSeenProbesPerCandidate)
-                                 .Max(kSeenMaxProbeCoordinates)
-                                 .DefaultValue(kSeenMaxProbeCoordinates)
-                                 .ShowButtons(true)
-                                 .Tooltip("Lowering this forces candidates to be deferred without needing ten on "
-                                          "screen, which is how the scheduling path gets exercised."));
-    if (ImGui::Button("Reset peak counters")) {
-        seenProbePeakBanked.clear();
-    }
-    ImGui::Text("Gameplay frame %u | candidates %d | coordinates %d / %d", seenProbeDebugFrame,
-                seenProbeCandidatesLastFrame, seenProbeCoordinatesLastFrame, SeenProbeBudget());
-    ImGui::Text("rejected (no useful projection) %d | deferred (no budget) %d | matched %d", seenProbeRejectedLastFrame,
-                seenProbeDeferredLastFrame, seenProbeMatchesLastFrame);
-    ImGui::Text("frames required %d | chest slop %.1f px (min %d) | max distance %.0f | item tolerance %d",
-                kSeenFramesRequired, kSeenProbeSlopPixels, kSeenProbeMinTolerance, kSeenMaxProbeDistance,
-                kSeenItemDepthTolerance);
-    ImGui::Separator();
-    for (const auto& geom : seenChestGeometryDebug) {
-        const char* name = Rando::StaticData::GetLocation(geom.rc)->GetShortName().c_str();
-        if (geom.colReason != nullptr) {
-            ImGui::Text("%s geometry: bgId %d rejected - %s", name, geom.bgId, geom.colReason);
-            continue;
-        }
-        ImGui::Text("%s geometry: bgId %d", name, geom.bgId);
-        ImGui::Indent();
-        ImGui::Text("bounds min (%5d,%5d,%5d) max (%5d,%5d,%5d)", geom.minBounds.x, geom.minBounds.y, geom.minBounds.z,
-                    geom.maxBounds.x, geom.maxBounds.y, geom.maxBounds.z);
-        ImGui::Text("centre (%7.1f,%7.1f,%7.1f) half (%7.1f,%7.1f,%7.1f) model", geom.centre.x, geom.centre.y,
-                    geom.centre.z, geom.halfExtent.x, geom.halfExtent.y, geom.halfExtent.z);
-        ImGui::Text("half world (%6.2f,%6.2f,%6.2f)", geom.halfExtent.x * geom.root.scale.x,
-                    geom.halfExtent.y * geom.root.scale.y, geom.halfExtent.z * geom.root.scale.z);
-        // A non-zero lag is the moving-chest case the root transform avoids.
-        ImGui::Text("root pos (%8.2f,%8.2f,%8.2f) lag vs dyna (%7.2f,%7.2f,%7.2f)", geom.root.pos.x, geom.root.pos.y,
-                    geom.root.pos.z, geom.root.pos.x - geom.dyna.pos.x, geom.root.pos.y - geom.dyna.pos.y,
-                    geom.root.pos.z - geom.dyna.pos.z);
-        ImGui::Text("root rot (%6d,%6d,%6d) dyna rot (%6d,%6d,%6d)", geom.root.rot.x, geom.root.rot.y, geom.root.rot.z,
-                    geom.dyna.rot.x, geom.dyna.rot.y, geom.dyna.rot.z);
-        ImGui::Text("dist %.0f euclid, %.0f axial, slop +/-%.1f world units", geom.distance, geom.axial,
-                    SeenProbeSlopWorld(geom.axial));
-        if (geom.probeReason != nullptr) {
-            ImGui::Text("REJECTED: %s - %d/%d probes on screen, span %.1f x %.1f (need %.1f)", geom.probeReason,
-                        geom.projected, kSeenProbesPerCandidate, geom.spanX, geom.spanY, kSeenMinScreenRadius);
-        }
-        ImGui::Unindent();
-    }
-    if (!seenChestGeometryDebug.empty()) {
-        ImGui::Separator();
-    }
-    if (seenProbeDebug.empty()) {
-        ImGui::TextUnformatted("No candidates registered by a draw this frame.");
-        return;
-    }
-    for (const auto& entry : seenProbeDebug) {
-        const char* name = Rando::StaticData::GetLocation(entry.rc)->GetShortName().c_str();
-        if (!entry.wasSampled) {
-            ImGui::Text("%s [%s] deferred - no coordinate budget", name, entry.isChest ? "chest" : "item");
-            continue;
-        }
-        auto peak = seenProbePeakBanked.find(entry.rc);
-        ImGui::Text("%s [%s] %d/%d matched (need %d), banked %d/%d (peak %d)", name, entry.isChest ? "chest" : "item",
-                    entry.matches, entry.pointCount, kSeenProbeMatchesRequired, entry.framesBanked, kSeenFramesRequired,
-                    peak == seenProbePeakBanked.end() ? 0 : peak->second);
-        ImGui::Indent();
-        // If "expected implies" disagrees with the measured distance, the probe and
-        // the geometry it was built from are not the same point.
-        ImGui::Text("dist %.0f euclid, expected implies %.0f axial, window +/-%.0f world units", entry.distance,
-                    entry.pointCount > 0 ? SeenDepthToAxial(entry.points[0].expectedZ) : 0.0f,
-                    SeenDepthWindowWorld(entry.distance, entry.tolerance));
-        for (int i = 0; i < entry.pointCount; i++) {
-            const auto& point = entry.points[i];
-            // For a chest the accepted band is [near, expected]; sampled should sit
-            // inside it. below/above says which end it fell outside.
-            const char* where = point.sampledZ < point.nearZ ? "below" : "above";
-            ImGui::Text("(%6.1f,%6.1f) near %6d expected %6d sampled %6d %s", point.x, point.y, point.nearZ,
-                        point.expectedZ, point.sampledZ, point.matched ? "PASS" : where);
-        }
-        ImGui::Unindent();
-    }
-}
-
 void CheckTrackerSettingsWindow::DrawElement() {
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, { 8.0f, 8.0f });
     if (ImGui::BeginTable("CheckTrackerSettingsTable", 2, ImGuiTableFlags_BordersH | ImGuiTableFlags_BordersV)) {
@@ -3574,7 +3170,6 @@ void CheckTrackerSettingsWindow::DrawElement() {
                                             .DefaultIndex(TRACKER_COMBO_BUTTON_L));
             }
         }
-        DrawSeenProbeOverlay();
         ImGui::BeginDisabled(CVarGetInteger(CVAR_SETTING("DisableChanges"), 0));
         SohGui::GetSohMenu()->MenuDrawItem(dungeonSpoilerWidget,
                                            static_cast<uint32_t>(ImGui::GetContentRegionAvail().x), THEME_COLOR);
@@ -3684,9 +3279,6 @@ void CheckTrackerWindow::InitElement() {
 }
 
 void CheckTrackerWindow::UpdateElement() {
-    // Runs every frame regardless of the window's visibility, which is what keeps
-    // the probe markers on screen while the menu is closed.
-    SeenDrawProbeMarkers();
 }
 
 void RegisterCheckTrackerWidgets() {
